@@ -1,8 +1,8 @@
 import json
-import os
-import selectors
+import queue
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import IO
@@ -10,6 +10,7 @@ from typing import IO
 from harness.rules import STDOUT_CAP, WATCHDOG_GRACE_MS
 
 RUNNER = Path(__file__).resolve().parent / "runner.py"
+DRAIN_GRACE_S = 0.2
 
 
 class AgentFailure(Exception):
@@ -30,7 +31,8 @@ class Agent:
         self.command = command
         self.stderr_tail = ""
         self._process: subprocess.Popen[bytes] | None = None
-        self._selector = selectors.DefaultSelector()
+        self._chunks: queue.Queue[tuple[str, bytes]] = queue.Queue()
+        self._readers: list[threading.Thread] = []
         self._buffer = b""
         self._tail = b""
 
@@ -43,8 +45,10 @@ class Agent:
             bufsize=0,
         )
         self._process = process
-        self._selector.register(_pipe(process.stdout), selectors.EVENT_READ, "stdout")
-        self._selector.register(_pipe(process.stderr), selectors.EVENT_READ, "stderr")
+        self._readers = [
+            self._reader(_pipe(process.stdout), "stdout"),
+            self._reader(_pipe(process.stderr), "stderr"),
+        ]
         ready = self._await_line(time.monotonic() + init_budget_s)
         if ready is None:
             raise AgentFailure("init" if process.poll() is None else "crash")
@@ -68,14 +72,28 @@ class Agent:
         if self._process is None:
             return
         self._process.kill()
+        for reader in self._readers:
+            reader.join(DRAIN_GRACE_S)
         self._drain()
         self.stderr_tail = self._tail.decode("utf-8", "replace")
-        self._selector.close()
-        for stream in (self._process.stdin, self._process.stdout, self._process.stderr):
-            if stream is not None:
-                stream.close()
+        _pipe(self._process.stdin).close()
         self._process.wait()
         self._process = None
+        self._readers = []
+
+    def _reader(self, stream: IO[bytes], name: str) -> threading.Thread:
+        reader = threading.Thread(target=self._forward, args=(stream, name), daemon=True)
+        reader.start()
+        return reader
+
+    # the reader owns its pipe, so a thread outliving stop() never reads a closed stream
+    def _forward(self, stream: IO[bytes], name: str) -> None:
+        with stream:
+            while True:
+                chunk = stream.read(STDOUT_CAP)
+                self._chunks.put((name, chunk))
+                if not chunk:
+                    return
 
     def _await_line(self, deadline: float) -> bytes | None:
         while b"\n" not in self._buffer:
@@ -84,35 +102,27 @@ class Agent:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return None
-            for key, _ in self._selector.select(remaining):
-                chunk = os.read(key.fd, STDOUT_CAP)
-                if key.data == "stderr":
-                    self._keep(key, chunk)
-                elif not chunk:
-                    raise AgentFailure("crash")
-                else:
-                    self._buffer += chunk
+            try:
+                name, chunk = self._chunks.get(timeout=remaining)
+            except queue.Empty:
+                return None
+            if name == "stderr":
+                self._tail += chunk
+            elif not chunk:
+                raise AgentFailure("crash")
+            else:
+                self._buffer += chunk
         line, _, self._buffer = self._buffer.partition(b"\n")
         return line
 
-    # the writer is dead by now, so the pipes hold a bounded amount and this terminates
     def _drain(self) -> None:
-        while self._selector.get_map():
-            events = self._selector.select(0)
-            if not events:
+        while True:
+            try:
+                name, chunk = self._chunks.get_nowait()
+            except queue.Empty:
                 return
-            for key, _ in events:
-                chunk = os.read(key.fd, STDOUT_CAP)
-                if key.data == "stderr":
-                    self._keep(key, chunk)
-                elif not chunk:
-                    self._selector.unregister(key.fileobj)
-
-    def _keep(self, key: selectors.SelectorKey, chunk: bytes) -> None:
-        if not chunk:
-            self._selector.unregister(key.fileobj)
-            return
-        self._tail += chunk
+            if name == "stderr":
+                self._tail += chunk
 
 
 def _pipe(stream: IO[bytes] | None) -> IO[bytes]:
