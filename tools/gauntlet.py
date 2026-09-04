@@ -38,19 +38,21 @@ OPPONENT = Path("baselines/stockfish")
 # Measuring only against one engine family risks fitting to that family's particular weaknesses:
 # a change that beats Stockfish and nothing else has not necessarily made us stronger. These are
 # a transfer check, so they claim no rating; only whether a gain shows up here too.
-DIVERSE: tuple[tuple[str, str, str], ...] = (
-    ("blunder", "BLUNDER_BIN", "60000"),
-    ("weiss", "WEISS_BIN", "60000"),
-)
+# Limited by depth, not nodes. `go nodes` is optional in the UCI spec and Weiss simply never
+# answers it, which showed up as the opponent losing every game on time rather than as an
+# error. Depth and movetime are the limits an arbitrary engine can be relied on to honour.
+# Depth 6 is where Weiss scores about 50% against us, so the rung sits at our own level
+# where a change actually shows, rather than at a whitewash in either direction.
+DIVERSE: tuple[tuple[str, str, str], ...] = (("weiss", "WEISS_BIN", "6"),)
 
 
-def diverse_rungs(nodes: str) -> list[tuple[str, int | None, dict[str, str]]]:
+def diverse_rungs(depth: str) -> list[tuple[str, int | None, dict[str, str]]]:
     """Rungs for whichever outside engines are actually installed on this machine."""
     rungs: list[tuple[str, int | None, dict[str, str]]] = []
     for name, variable, default in DIVERSE:
         binary = os.environ.get(variable)
         if binary and Path(binary).is_file():
-            rungs.append((name, None, {"SF_BIN": binary, "SF_NODES": nodes or default}))
+            rungs.append((name, None, {"SF_BIN": binary, "SF_DEPTH": depth or default}))
     return rungs
 
 
@@ -92,9 +94,9 @@ def main() -> None:
     parser.add_argument(
         "--diverse",
         action="store_true",
-        help="also play the outside engines named by BLUNDER_BIN and WEISS_BIN",
+        help="also play the outside engines named by WEISS_BIN",
     )
-    parser.add_argument("--diverse-nodes", type=str, default="", help="node cap for those")
+    parser.add_argument("--diverse-depth", type=str, default="", help="depth cap for those")
     parser.add_argument(
         "--workers", type=int, default=max(1, multiprocessing.cpu_count() // 2 - 2)
     )
@@ -108,7 +110,7 @@ def main() -> None:
     wanted = {name for name in arguments.rungs.split(",") if name}
     available = list(LADDER)
     if arguments.diverse:
-        available += diverse_rungs(arguments.diverse_nodes)
+        available += diverse_rungs(arguments.diverse_depth)
     rungs = [rung for rung in available if not wanted or rung[0] in wanted]
     agent = arguments.agent.resolve()
     opponent = OPPONENT.resolve()
