@@ -31,7 +31,26 @@ CLAMP_CP = 1500
 MATE_CP = 2500
 
 
-def load(path: Path, limit: int | None) -> tuple[list[str], list[float]]:
+def is_quiet(board: chess.Board, best: str | None) -> bool:
+    """Whether a static evaluation can be expected to mean anything here.
+
+    The agent only ever evaluates positions its quiescence search has already settled, so a
+    position with the king in check, or whose best move is a capture, is one where the label
+    reflects a tactic the linear model has no way to represent. Fitting on those teaches it to
+    predict tactics it structurally cannot see, at the cost of the positional terms it can.
+    """
+    if board.is_check():
+        return False
+    if best is None:
+        return True
+    try:
+        move = chess.Move.from_uci(best)
+    except ValueError:
+        return True
+    return not board.is_capture(move) and move.promotion is None
+
+
+def load(path: Path, limit: int | None, quiet_only: bool = False) -> tuple[list[str], list[float]]:
     """Positions and their labels, as centipawns from White's point of view."""
     fens: list[str] = []
     targets: list[float] = []
@@ -50,6 +69,8 @@ def load(path: Path, limit: int | None) -> tuple[list[str], list[float]]:
                 continue
             # Labels are relative to the side to move; features are always White's view.
             board = chess.Board(row["fen"])
+            if quiet_only and not is_quiet(board, row.get("best")):
+                continue
             fens.append(row["fen"])
             targets.append(float(score if board.turn == chess.WHITE else -score))
             if limit and len(fens) >= limit:
@@ -162,10 +183,15 @@ def main() -> None:
     parser.add_argument("--batch", type=int, default=4_096)
     parser.add_argument("--rate", type=float, default=1.0)
     parser.add_argument("--holdout", type=float, default=0.1)
+    parser.add_argument(
+        "--quiet-only",
+        action="store_true",
+        help="skip checks and positions whose best move is a capture",
+    )
     arguments = parser.parse_args()
 
     torch.set_num_threads(max(1, torch.get_num_threads()))
-    fens, targets = load(arguments.data, arguments.limit)
+    fens, targets = load(arguments.data, arguments.limit, arguments.quiet_only)
     print(f"{len(fens):,} labelled positions")
     if len(fens) < 1000:
         raise SystemExit("not enough labelled positions to fit anything trustworthy")
