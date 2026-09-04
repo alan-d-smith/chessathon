@@ -100,8 +100,10 @@ def initial() -> torch.Tensor:
 
     for name in features.STRUCTURAL:
         term = features.STRUCTURAL_INDEX[name]
-        fitted[term * 2] = current.STRUCTURAL_MG[name]
-        fitted[term * 2 + 1] = current.STRUCTURAL_EG[name]
+        # A term added since the last fit starts at zero, so the data decides it from scratch
+        # rather than the tuner failing on a key that weights.py has never heard of.
+        fitted[term * 2] = current.STRUCTURAL_MG.get(name, 0)
+        fitted[term * 2 + 1] = current.STRUCTURAL_EG.get(name, 0)
     return fitted
 
 
@@ -156,9 +158,9 @@ def main() -> None:
     parser.add_argument("--data", type=Path, default=Path("data/labelled.jsonl"))
     parser.add_argument("--out", type=Path, default=Path("weights.py"))
     parser.add_argument("--limit", type=int)
-    parser.add_argument("--epochs", type=int, default=60)
-    parser.add_argument("--batch", type=int, default=16_384)
-    parser.add_argument("--rate", type=float, default=2.0)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch", type=int, default=4_096)
+    parser.add_argument("--rate", type=float, default=1.0)
     parser.add_argument("--holdout", type=float, default=0.1)
     arguments = parser.parse_args()
 
@@ -179,6 +181,16 @@ def main() -> None:
     split = int(count * (1.0 - arguments.holdout))
     train, test = order[:split], order[split:]
     optimiser = torch.optim.Adam([weights], lr=arguments.rate)
+
+    # What the weights already in play score on the holdout. Every later number is only
+    # meaningful against this one: a loss that falls is not the same as a loss that beats it.
+    with torch.no_grad():
+        baseline = float(
+            torch.nn.functional.mse_loss(
+                torch.sigmoid(matrix[test] @ weights * SCALE), wanted[test]
+            )
+        )
+    print(f"  holdout before tuning {baseline:.6f}")
 
     best = float("inf")
     kept = weights.detach().clone()
@@ -206,7 +218,8 @@ def main() -> None:
             f"holdout {held:.6f}{'  *' if held == best else ''}"
         )
 
-    print(f"best holdout {best:.6f}")
+    gain = (baseline - best) / baseline if baseline else 0.0
+    print(f"best holdout {best:.6f} against {baseline:.6f} untuned, {gain:+.1%}")
     emit(kept, arguments.out, len(fens))
     print(f"weights written to {arguments.out}")
 

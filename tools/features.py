@@ -43,6 +43,7 @@ STRUCTURAL: tuple[str, ...] = (
     "rook_open",
     "rook_semi",
     "shield_missing",
+    "tempo",
 )
 TERMS = PSQT_TERMS + len(STRUCTURAL)
 FEATURES = TERMS * 2  # a midgame and an endgame slot for every term
@@ -158,6 +159,9 @@ def counts(board: chess.Board) -> dict[int, int]:
             present = (mine & SHIELD[colour][square]).bit_count()
             add(STRUCTURAL_INDEX["shield_missing"], sign * (SHIELD_WANTED - min(present, 3)))
 
+    # Having the move is worth something on its own, and nothing else in the vector says
+    # whose turn it is. Without this the fit averages the two cases and blurs both.
+    add(STRUCTURAL_INDEX["tempo"], 1 if board.turn == chess.WHITE else -1)
     return net
 
 

@@ -50,7 +50,10 @@ def walk(
     """One randomised game, yielding every `every`th position after the random opening."""
     board = chess.Board()
     for ply in range(max_plies):
-        if board.is_game_over(claim_draw=True):
+        # Deliberately not claim_draw: that replays the move stack hunting a threefold, at
+        # every ply of every game, and it dominated the run. Checkmate, stalemate and the
+        # material draws are enough to know a playout is over.
+        if board.is_game_over():
             return
         if ply < opening_plies:
             board.push(rng.choice(list(board.legal_moves)))
@@ -72,8 +75,7 @@ def batch(task: tuple[int, int, int, int, int, int]) -> list[str]:
     found: list[str] = []
     for _ in range(games):
         for board in walk(ENGINE, rng, opening_plies, playout_nodes, max_plies, every):
-            if not board.is_game_over(claim_draw=True):
-                found.append(board.fen())
+            found.append(board.fen())
     return found
 
 
@@ -105,15 +107,14 @@ def main() -> None:
     kept: list[str] = []
 
     def keep(fen: str) -> None:
-        board = chess.Board(fen)
-        identity = key(board)
+        identity = " ".join(fen.split(" ")[:4])
         if identity not in seen:
             seen.add(identity)
             kept.append(fen)
 
     if arguments.from_pgn:
         for board in from_pgn(arguments.from_pgn, arguments.every):
-            if not board.is_game_over(claim_draw=True):
+            if not board.is_game_over():
                 keep(board.fen())
     else:
         workers = max(1, min(arguments.workers, arguments.games))

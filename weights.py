@@ -142,6 +142,7 @@ STRUCTURAL_MG = {
     "rook_open": 18,
     "rook_semi": 9,
     "shield_missing": 0,
+    "tempo": 0,
 }
 STRUCTURAL_EG = {
     "doubled": -12,
@@ -156,5 +157,6 @@ STRUCTURAL_EG = {
     "rook_open": 18,
     "rook_semi": 9,
     "shield_missing": 0,
+    "tempo": 0,
 }
 # fmt: on

@@ -84,6 +84,7 @@ BISHOP_PAIR: Final = 8
 ROOK_OPEN: Final = 9
 ROOK_SEMI: Final = 10
 SHIELD_MISSING: Final = 11
+TEMPO: Final = 12
 STRUCTURAL_NAMES: Final = (
     "doubled",
     "isolated",
@@ -97,6 +98,7 @@ STRUCTURAL_NAMES: Final = (
     "rook_open",
     "rook_semi",
     "shield_missing",
+    "tempo",
 )
 SHIELD_WANTED: Final = 3
 
@@ -333,6 +335,10 @@ def evaluate(board: chess.Board) -> int:
             present = (pawns & mine & SHIELD[colour][square]).bit_count()
             missing = SHIELD_WANTED - min(present, SHIELD_WANTED)
             score += sign * missing * weight[SHIELD_MISSING]
+
+    # Having the move is worth something, and it is the one thing the piece placement cannot
+    # say. Added from White's view so the flip below hands it to whoever is actually to move.
+    score += weight[TEMPO] if board.turn == chess.WHITE else -weight[TEMPO]
 
     return score if board.turn == chess.WHITE else -score
 
