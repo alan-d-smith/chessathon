@@ -30,11 +30,23 @@ from harness.sandbox import local
 
 # A void game is one where both agents broke, so it says nothing about the positions in it.
 RESULTS: dict[str, float] = {"white": 1.0, "black": 0.0, "draw": 0.5}
+LINE_END = chr(10)
 
 
-def one(task: tuple[Path, Path, str, int, int, int]) -> list[tuple[str, float]]:
-    """Play one game and return every sampled position with the result, from White's view."""
-    white, black, fen, base_ms, increment_ms, skip = task
+def row(fen: str, score: float, game_id: int) -> dict[str, object]:
+    """One record. The game id is what lets a holdout split by game rather than by
+    position, which matters because every position in a game carries the same label."""
+    return {"fen": fen, "result": score, "game": game_id}
+
+
+def one(task: tuple[Path, Path, str, int, int, int, int]) -> list[tuple[str, float, int]]:
+    """Play one game and return every sampled position with the result, from White's view.
+
+    Every position carries the id of the game it came from, because they all share that one
+    game's label. Without it a holdout split by position lands near-duplicates on both sides
+    and scores the fit against labels it has effectively already been shown.
+    """
+    white, black, fen, base_ms, increment_ms, skip, game_id = task
     outcome = play_match(local(white), local(black), base_ms, increment_ms, start_fen=fen)
     score = RESULTS.get(outcome.result)
     if score is None:
@@ -44,11 +56,11 @@ def one(task: tuple[Path, Path, str, int, int, int]) -> list[tuple[str, float]]:
     if game is None:
         return []
     board = game.board()
-    rows: list[tuple[str, float]] = []
+    rows: list[tuple[str, float, int]] = []
     for ply, move in enumerate(game.mainline_moves()):
         board.push(move)
         if ply >= skip and not board.is_check():
-            rows.append((board.fen(), score))
+            rows.append((board.fen(), score, game_id))
     return rows
 
 
@@ -82,6 +94,7 @@ def main() -> None:
             arguments.base_ms,
             arguments.increment_ms,
             arguments.skip_plies,
+            index,
         )
         for index in range(arguments.games)
     ]
@@ -95,8 +108,8 @@ def main() -> None:
         multiprocessing.Pool(workers) as pool,
     ):
         for done, rows in enumerate(pool.imap_unordered(one, tasks), start=1):
-            for fen, score in rows:
-                sink.write(json.dumps({"fen": fen, "result": score}) + "\n")
+            for fen, score, game_id in rows:
+                sink.write(json.dumps(row(fen, score, game_id)) + LINE_END)
                 written += 1
             if done % 50 == 0 or done == len(tasks):
                 print(f"  {done}/{len(tasks)} games, {written:,} positions")

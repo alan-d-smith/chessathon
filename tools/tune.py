@@ -50,7 +50,7 @@ def is_quiet(board: chess.Board, best: str | None) -> bool:
     return not board.is_capture(move) and move.promotion is None
 
 
-def load_outcomes(path: Path, limit: int | None) -> tuple[list[str], list[float]]:
+def load_outcomes(path: Path, limit: int | None) -> tuple[list[str], list[float], list[int]]:
     """Positions labelled by how their game finished, already on the 0..1 scale a score lives on.
 
     No sigmoid conversion: a result is a probability rather than an opinion in centipawns, which
@@ -59,6 +59,7 @@ def load_outcomes(path: Path, limit: int | None) -> tuple[list[str], list[float]
     """
     fens: list[str] = []
     targets: list[float] = []
+    games: list[int] = []
     with path.open(encoding="utf-8") as handle:
         for line in handle:
             try:
@@ -67,9 +68,10 @@ def load_outcomes(path: Path, limit: int | None) -> tuple[list[str], list[float]
                 continue
             fens.append(row["fen"])
             targets.append(float(row["result"]))
+            games.append(int(row.get("game", len(games))))
             if limit and len(fens) >= limit:
                 break
-    return fens, targets
+    return fens, targets, games
 
 
 def load(path: Path, limit: int | None, quiet_only: bool = False) -> tuple[list[str], list[float]]:
@@ -218,11 +220,22 @@ def main() -> None:
     arguments = parser.parse_args()
 
     torch.set_num_threads(max(1, torch.get_num_threads()))
+    groups: list[int] = []
     if arguments.outcomes:
-        fens, targets = load_outcomes(arguments.data, arguments.limit)
+        fens, targets, groups = load_outcomes(arguments.data, arguments.limit)
+        distinct = len(set(groups))
+        print(f"{len(fens):,} positions from {distinct:,} games")
+        # One label per game, so the games are the sample size, not the positions. Fitting
+        # ~800 weights to a few hundred games produces confident nonsense, and the holdout
+        # will not say so unless it is split by game.
+        if distinct < features.FEATURES:
+            print(
+                f"  WARNING: {distinct:,} games for {features.FEATURES:,} weights. "
+                "Expect overfitting; gather more games before believing this."
+            )
     else:
         fens, targets = load(arguments.data, arguments.limit, arguments.quiet_only)
-    print(f"{len(fens):,} labelled positions")
+        print(f"{len(fens):,} labelled positions")
     if len(fens) < 1000:
         raise SystemExit("not enough labelled positions to fit anything trustworthy")
 
@@ -235,9 +248,18 @@ def main() -> None:
     # A holdout the fit never sees, so an improving training loss with a worsening holdout
     # shows up as what it is rather than as progress.
     count = len(fens)
-    order = torch.randperm(count)
-    split = int(count * (1.0 - arguments.holdout))
-    train, test = order[:split], order[split:]
+    if groups:
+        # Split by game. Positions from one game share a label, so splitting by position puts
+        # near-copies of the same answer on both sides and the holdout flatters the fit.
+        unique = sorted(set(groups))
+        shuffled = [unique[i] for i in torch.randperm(len(unique)).tolist()]
+        held = set(shuffled[: max(1, int(len(unique) * arguments.holdout))])
+        train = torch.tensor([i for i, g in enumerate(groups) if g not in held], dtype=torch.long)
+        test = torch.tensor([i for i, g in enumerate(groups) if g in held], dtype=torch.long)
+    else:
+        order = torch.randperm(count)
+        split = int(count * (1.0 - arguments.holdout))
+        train, test = order[:split], order[split:]
     optimiser = torch.optim.Adam([weights], lr=arguments.rate)
 
     # What the weights already in play score on the holdout. Every later number is only
