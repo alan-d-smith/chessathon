@@ -100,6 +100,32 @@ opposite things. `data/openings.txt` is committed so comparisons stay on one yar
 `baselines/v1` through `v4` are frozen previous versions. "Better than my last one" is the only
 comparison that matters, so each accepted change becomes the next opponent.
 
+## Fitting the evaluation
+
+The evaluation is a dot product: every term is a count of something on the board times a
+weight. `tools/features.py` writes that dot product out explicitly, which means the weights can
+be fitted to labelled positions rather than guessed. `weights.py` holds the result and ships
+inside the zip alongside `agent.py`.
+
+```
+uv run python -m tools.gen_positions --games 6000 --workers 48 --out data/positions.txt
+uv run python -m tools.label --in data/positions.txt --out data/labelled.jsonl --nodes 50000
+uv run python -m tools.tune --data data/labelled.jsonl --out weights.py
+```
+
+Every weight is tapered between a midgame and an endgame value. Phase only takes 25 values, so
+all 25 blends are built once at import: tapering everything therefore costs the search nothing,
+and evaluation still does one table lookup per piece.
+
+The fit starts from the weights already in `weights.py` rather than from noise, so a term the
+data has little to say about keeps its current value and a run refines the last one. It reports
+the holdout loss of the untuned weights first, because a loss that falls is not the same as a
+loss that beats what was already there. Weights round-trip through `emit`/`initial` byte for
+byte, which is where an off-by-one in the table layout would otherwise hide in silence.
+
+Labelling positions with an existing engine is explicitly permitted; the ban is on what the zip
+contains. What ships is a table of our own numbers.
+
 Building a dataset is two steps. Positions first, then labels:
 
 ```
