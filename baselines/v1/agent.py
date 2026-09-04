@@ -19,10 +19,7 @@ import chess
 INFINITY: Final = 1 << 20
 MATE: Final = 1 << 16
 MAX_DEPTH: Final = 64
-# The search can only stop on a clock check, so this interval is the worst case by which it
-# overruns its budget. 512 nodes costs a few microseconds a second and bounds the overrun to
-# milliseconds; at 2048 a slow search can sail a quarter of a second past the deadline.
-CHECK_INTERVAL: Final = 512
+CHECK_INTERVAL: Final = 2048
 
 # Wall time is what the referee measures, so the budget leaves room for the round trip and the
 # search checks the clock mid-flight rather than only between depths.
@@ -31,9 +28,6 @@ EXPECTED_MOVES: Final = 30
 MAX_CLOCK_FRACTION: Final = 0.35
 INCREMENT_SHARE: Final = 0.75
 ASSUMED_INCREMENT_MS: Final = 500
-# Twice the published increment. The inferred value feeds a budget whose spend feeds the next
-# inference, so it needs a ceiling that a feedback loop cannot climb past.
-INCREMENT_CEILING_MS: Final = 1000.0
 
 VALUE: Final = {
     chess.PAWN: 100,
@@ -44,22 +38,12 @@ VALUE: Final = {
     chess.KING: 0,
 }
 # Phase runs from all the heavy pieces on to none of them, and tapers the king between the
-# table that wants it castled and the table that wants it marching. Minors count 1, rooks 2,
-# queens 4, so a full board is 24.
+# table that wants it castled and the table that wants it marching.
+PHASE_WEIGHT: Final = {chess.KNIGHT: 1, chess.BISHOP: 1, chess.ROOK: 2, chess.QUEEN: 4}
 TOTAL_PHASE: Final = 24
 
 TT_LIMIT: Final = 400_000
 REPETITION_PENALTY: Final = 40
-
-# Search shaping. Alpha-beta only pays off when it can cut, so these decide what never gets
-# searched at all: a null move to prove a position is already winning, reductions for quiet
-# moves the ordering put last, and a margin below which a capture cannot rescue the line.
-NULL_MIN_DEPTH: Final = 3
-NULL_REDUCTION: Final = 2
-LMR_MIN_DEPTH: Final = 3
-LMR_MIN_MOVE: Final = 4
-LMR_DEEP_MOVE: Final = 8
-DELTA_MARGIN: Final = 200
 
 
 def read(rows: str) -> list[int]:
@@ -139,25 +123,15 @@ KING_ENDGAME: Final = read("""
    -50 -30 -30 -30 -30 -30 -30 -50
 """)
 
+TABLES: Final = {
+    chess.PAWN: PAWN_TABLE,
+    chess.KNIGHT: KNIGHT_TABLE,
+    chess.BISHOP: BISHOP_TABLE,
+    chess.ROOK: ROOK_TABLE,
+    chess.QUEEN: QUEEN_TABLE,
+}
 # Mirroring once at import saves a square_mirror call in the hottest loop there is.
 MIRROR: Final = [chess.square_mirror(square) for square in range(64)]
-
-
-def fold(table: list[int], value: int) -> tuple[list[int], list[int]]:
-    """Fold material into the square table, once per colour, so evaluation is one lookup."""
-    return (
-        [value + table[square] for square in range(64)],
-        [value + table[MIRROR[square]] for square in range(64)],
-    )
-
-
-PAWN_W, PAWN_B = fold(PAWN_TABLE, VALUE[chess.PAWN])
-KNIGHT_W, KNIGHT_B = fold(KNIGHT_TABLE, VALUE[chess.KNIGHT])
-BISHOP_W, BISHOP_B = fold(BISHOP_TABLE, VALUE[chess.BISHOP])
-ROOK_W, ROOK_B = fold(ROOK_TABLE, VALUE[chess.ROOK])
-QUEEN_W, QUEEN_B = fold(QUEEN_TABLE, VALUE[chess.QUEEN])
-KING_MG_B: Final = [KING_MIDGAME[MIRROR[square]] for square in range(64)]
-KING_EG_B: Final = [KING_ENDGAME[MIRROR[square]] for square in range(64)]
 
 EXACT: Final = 0
 LOWER: Final = 1
@@ -177,13 +151,6 @@ seen: set[Hashable] = set()
 
 nodes = 0
 deadline = 0.0
-reached = 0  # deepest iteration completed on the last move, for diagnostics
-
-# The increment is inferred from how the clock moves between our own turns, starting from the
-# published 0.5s and correcting itself after one move at whatever the real time control is.
-increment_ms = float(ASSUMED_INCREMENT_MS)
-last_clock_ms: float | None = None
-last_spent_ms = 0.0
 
 
 def tick() -> None:
@@ -194,54 +161,32 @@ def tick() -> None:
         raise Timeout
 
 
-def scan(mask: int, table: list[int]) -> int:
-    """Sum a table over the set bits of a bitboard, in plain integer arithmetic.
-
-    board.pieces() would read better, but it allocates a SquareSet per call and evaluation is
-    the hottest function in the search: this is where the node rate comes from.
-    """
-    total = 0
-    while mask:
-        lowest = mask & -mask
-        total += table[lowest.bit_length() - 1]
-        mask ^= lowest
-    return total
+def phase_of(board: chess.Board) -> int:
+    remaining = sum(
+        weight * len(board.pieces(piece, chess.WHITE) | board.pieces(piece, chess.BLACK))
+        for piece, weight in PHASE_WEIGHT.items()
+    )
+    return min(remaining, TOTAL_PHASE)
 
 
 def evaluate(board: chess.Board) -> int:
     """Material and placement, from the side to move. Positive means the mover is better."""
-    white = board.occupied_co[chess.WHITE]
-    black = board.occupied_co[chess.BLACK]
-    pawns, knights = board.pawns, board.knights
-    bishops, rooks, queens = board.bishops, board.rooks, board.queens
+    score = 0
+    for piece, table in TABLES.items():
+        value = VALUE[piece]
+        for square in board.pieces(piece, chess.WHITE):
+            score += value + table[square]
+        for square in board.pieces(piece, chess.BLACK):
+            score -= value + table[MIRROR[square]]
 
-    score = (
-        scan(pawns & white, PAWN_W)
-        - scan(pawns & black, PAWN_B)
-        + scan(knights & white, KNIGHT_W)
-        - scan(knights & black, KNIGHT_B)
-        + scan(bishops & white, BISHOP_W)
-        - scan(bishops & black, BISHOP_B)
-        + scan(rooks & white, ROOK_W)
-        - scan(rooks & black, ROOK_B)
-        + scan(queens & white, QUEEN_W)
-        - scan(queens & black, QUEEN_B)
-    )
-
-    # Popcounts beat counting squares one at a time, and the phase is only ever a weighted count.
-    phase = (knights | bishops).bit_count() + rooks.bit_count() * 2 + queens.bit_count() * 4
-    phase = min(phase, TOTAL_PHASE)
-    endgame = TOTAL_PHASE - phase
-
-    kings = board.kings
-    white_king = kings & white
-    if white_king:
-        square = white_king.bit_length() - 1
-        score += (KING_MIDGAME[square] * phase + KING_ENDGAME[square] * endgame) // TOTAL_PHASE
-    black_king = kings & black
-    if black_king:
-        square = black_king.bit_length() - 1
-        score -= (KING_MG_B[square] * phase + KING_EG_B[square] * endgame) // TOTAL_PHASE
+    phase = phase_of(board)
+    for colour, sign in ((chess.WHITE, 1), (chess.BLACK, -1)):
+        king = board.king(colour)
+        if king is None:
+            continue
+        square = king if colour == chess.WHITE else MIRROR[king]
+        tapered = KING_MIDGAME[square] * phase + KING_ENDGAME[square] * (TOTAL_PHASE - phase)
+        score += sign * tapered // TOTAL_PHASE
 
     return score if board.turn == chess.WHITE else -score
 
@@ -284,13 +229,6 @@ def quiesce(board: chess.Board, alpha: int, beta: int) -> int:
         board.generate_legal_captures(), key=lambda move: capture_value(board, move), reverse=True
     )
     for move in captures:
-        # Delta pruning: if winning the piece outright still falls short of alpha, the whole
-        # line is irrelevant and searching it is time spent proving something already known.
-        if move.promotion is None:
-            victim = board.piece_type_at(move.to_square)
-            gain = VALUE[victim] if victim is not None else VALUE[chess.PAWN]
-            if standing + gain + DELTA_MARGIN < alpha:
-                continue
         board.push(move)
         score = -quiesce(board, -beta, -alpha)
         board.pop()
@@ -300,23 +238,10 @@ def quiesce(board: chess.Board, alpha: int, beta: int) -> int:
     return alpha
 
 
-def has_pieces(board: chess.Board, colour: chess.Color) -> bool:
-    """Whether a side still holds a piece beyond pawns, which is what makes zugzwang unlikely."""
-    mine = board.occupied_co[colour]
-    return bool((board.knights | board.bishops | board.rooks | board.queens) & mine)
-
-
 def negamax(board: chess.Board, depth: int, alpha: int, beta: int, ply: int) -> int:
     tick()
     if board.is_insufficient_material() or board.halfmove_clock >= 100:
         return 0
-
-    # Never hand a position back to the evaluation with the king under fire: the reply is
-    # forced and the score is meaningless. Bounded by ply, so perpetual check cannot recurse
-    # forever on an extension that keeps renewing itself.
-    in_check = board.is_check()
-    if in_check and ply < MAX_DEPTH:
-        depth += 1
 
     original = alpha
     # Private, but it is the key the board already keeps for its own repetition checks, and it
@@ -337,42 +262,16 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int, ply: int) -> 
     if depth <= 0:
         return quiesce(board, alpha, beta)
 
-    # Null move: hand the opponent a free move, and if the position still beats beta then it
-    # was never worth searching properly. Skipped in check, and skipped without a piece on the
-    # board, because those are the positions where passing would genuinely have been best.
-    if depth >= NULL_MIN_DEPTH and not in_check and has_pieces(board, board.turn):
-        board.push(chess.Move.null())
-        score = -negamax(board, depth - 1 - NULL_REDUCTION, -beta, -beta + 1, ply + 1)
-        board.pop()
-        if score >= beta:
-            return beta
-
     moves = ordered(board, stored[3] if stored is not None else None, ply)
     if not moves:
-        return -MATE + ply if in_check else 0
+        return -MATE + ply if board.is_check() else 0
 
     best_move: chess.Move | None = None
     best_score = -INFINITY
-    for index, move in enumerate(moves):
-        quiet = not board.is_capture(move) and move.promotion is None
+    for move in moves:
+        quiet = not board.is_capture(move)
         board.push(move)
-
-        # Late quiet moves are searched shallow and on a null window, on the bet that the
-        # ordering was right and they will not beat alpha. A move that beats it anyway is
-        # re-searched at full depth, so the bet costs nothing when it is wrong.
-        reduction = 0
-        if depth >= LMR_MIN_DEPTH and index >= LMR_MIN_MOVE and quiet and not board.is_check():
-            reduction = 1 if index < LMR_DEEP_MOVE else 2
-
-        if index == 0:
-            score = -negamax(board, depth - 1, -beta, -alpha, ply + 1)
-        else:
-            score = -negamax(board, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1)
-            if reduction and score > alpha:
-                score = -negamax(board, depth - 1, -alpha - 1, -alpha, ply + 1)
-            if alpha < score < beta:
-                score = -negamax(board, depth - 1, -beta, -alpha, ply + 1)
-
+        score = -negamax(board, depth - 1, -beta, -alpha, ply + 1)
         board.pop()
         if score > best_score:
             best_score = score
@@ -395,14 +294,9 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int, ply: int) -> 
 
 
 def budget_s(time_left_ms: int) -> float:
-    """Spend a share of the clock, never a fixed amount, and never most of what is left.
-
-    The increment is worth spending because it comes back every move, but the contract never
-    states it, so it is measured rather than assumed: guessing 0.5s at a time control that pays
-    0.1s spends five times the increment every move and walks the clock down to a flag.
-    """
+    """Spend a share of the clock, never a fixed amount, and never most of what is left."""
     usable = max(0.0, time_left_ms - MOVE_OVERHEAD_MS)
-    share = usable / EXPECTED_MOVES + increment_ms * INCREMENT_SHARE
+    share = usable / EXPECTED_MOVES + ASSUMED_INCREMENT_MS * INCREMENT_SHARE
     return min(share, usable * MAX_CLOCK_FRACTION) / 1000.0
 
 
@@ -412,26 +306,16 @@ def get_move(fen: str, time_left_ms: int) -> str:
     fen           the position to move in; your colour is the side to move
     time_left_ms  your clock before this move, in milliseconds
     """
-    global deadline, nodes, reached, increment_ms, last_clock_ms, last_spent_ms
+    global deadline, nodes
 
     board = chess.Board(fen)
     legal = list(board.legal_moves)
     if not legal:
         raise ValueError(f"no legal move in {fen}")
 
-    # Whatever the clock gained back since our last turn, beyond what we spent, is the
-    # increment. Measured from inside, so it under-reads by the round trip and errs slow.
-    # Bounded hard: the inference feeds the budget that the same spend then feeds back into,
-    # so an unmoving clock would otherwise ratchet it upwards a move at a time.
-    if last_clock_ms is not None:
-        measured = time_left_ms - (last_clock_ms - last_spent_ms)
-        increment_ms = min(max(measured, 0.0), INCREMENT_CEILING_MS)
-
-    started = time.monotonic()
     seen.add(board._transposition_key())
-    deadline = started + budget_s(time_left_ms)
+    deadline = time.monotonic() + budget_s(time_left_ms)
     nodes = 0
-    reached = 0
 
     # Whatever happens below, this is already legal, so a timeout or a bug in the search costs
     # a weaker move rather than the game.
@@ -466,10 +350,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
             choice = best_move
         if not finished:
             break
-        reached = depth
         if abs(best_score) > MATE - MAX_DEPTH:
             break  # a mate score will not get better with depth
 
-    last_clock_ms = float(time_left_ms)
-    last_spent_ms = (time.monotonic() - started) * 1000.0
     return choice.uci()
