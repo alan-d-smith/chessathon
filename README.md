@@ -56,11 +56,46 @@ evaluation worth searching with.
   the point: jitting a shallow search buys headroom, not depth. Read it for the warm-up call
   at the bottom, which is how you keep compilation off your clock.
 
+## Sparring and training data
+
+`baselines/stockfish` is a local opponent only. Shipping a third party engine, a wrapper around
+one, or a network derived from one is disqualifying and the check is retroactive, so it lives
+under `baselines/` where `harness/package.py` cannot reach it: the packager takes `*.py` at the
+repo root plus `weights/`, and nothing else. Labelling positions with an existing engine is
+explicitly allowed; the ban is on what the zip contains.
+
+It needs a Stockfish binary. Point `SF_BIN` at one, or put it on `PATH`. Strength is set by
+environment variable, so the one directory is a ladder of graded opponents:
+
+```
+SF_NODES=1000 uv run python -m harness.arena --opponent baselines/stockfish --games 20
+SF_ELO=1600   uv run python -m harness.arena --opponent baselines/stockfish --games 20
+SF_SKILL=20   uv run python -m harness.arena --opponent baselines/stockfish --games 20
+```
+
+`SF_NODES` is the one to measure with, because a fixed node count is reproducible and ignores
+the clock; `SF_ELO` (1320-3190) and `SF_SKILL` (0-20) add deliberate randomness. `SF_NODES=1000`
+is roughly `baselines/minimax` strength, which makes it the first rung.
+
+Building a dataset is two steps. Positions first, then labels:
+
+```
+uv run python -m tools.gen_positions --games 500 --out data/positions.txt
+uv run python -m tools.label --in data/positions.txt --out data/labelled.jsonl --nodes 200000
+```
+
+`gen_positions` walks a few random plies for variety and lets the engine play on from there, so
+the positions resemble ones a real game reaches rather than ones only a random mover does.
+`label` writes `{fen, cp, mate, best, nodes}` per line with `cp` from the side to move, runs one
+engine per core, and resumes where it left off. `data/` is gitignored.
+
 ## What's here
 
 ```
 agent.py             your submission
 baselines/           random, greedy, minimax, numba; each is a directory with an agent.py
+baselines/stockfish  a local sparring partner, never shipped
+tools/               position generation and Stockfish labelling for training data
 harness/runner.py    the process the platform runs your agent in
 harness/referee.py   the clock, legality, draw and adjudication rules
 harness/rules.py     the event constants the harness enforces
