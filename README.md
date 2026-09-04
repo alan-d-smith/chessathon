@@ -77,6 +77,29 @@ SF_SKILL=20   uv run python -m harness.arena --opponent baselines/stockfish --ga
 the clock; `SF_ELO` (1320-3190) and `SF_SKILL` (0-20) add deliberate randomness. `SF_NODES=1000`
 is roughly `baselines/minimax` strength, which makes it the first rung.
 
+## Measuring a change
+
+`harness/arena.py` starts every game from the standard position. Against a baseline that picks
+randomly among equal moves that is fine, but between two deterministic agents it replays one
+game and reports it as a sample: twenty games, two distinct results. Every A/B comparison here
+goes through `tools/match.py` instead, which plays an opening suite from both sides, in
+parallel, and stops as soon as the result is statistically settled.
+
+```
+uv run python -m tools.openings --count 300 --out data/openings.txt
+uv run python -m tools.match --agent . --opponent baselines/v4
+uv run python -m tools.bench --ms 2000 --profile
+```
+
+The match runs an SPRT against "no better" versus "worth at least 15 Elo", so a clear change is
+decided in around a hundred games and only a marginal one costs the full suite. It reports Elo
+with a 95% interval, and names which side was responsible for any flag or crash, because an
+opponent losing on time and our agent losing on time read identically in a score line and mean
+opposite things. `data/openings.txt` is committed so comparisons stay on one yardstick.
+
+`baselines/v1` through `v4` are frozen previous versions. "Better than my last one" is the only
+comparison that matters, so each accepted change becomes the next opponent.
+
 Building a dataset is two steps. Positions first, then labels:
 
 ```

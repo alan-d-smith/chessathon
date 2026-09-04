@@ -1,11 +1,11 @@
-"""Build a pool of positions to label.
+"""Build a pool of positions to label, one engine per core.
 
-Random plies alone give positions no real game reaches, so the default walks a few random
-moves for variety and then lets Stockfish play on at a low node count, sampling as it goes.
-That lands in the same middlegames the rated games will, which is the point: an evaluation is
-only worth what it scores on the positions it actually sees.
+Random plies alone give positions no real game reaches, so each walk takes a few random moves
+for variety and then lets Stockfish play on at a low node count, sampling as it goes. That
+lands in the same middlegames the rated games will, which is the point: an evaluation fitted on
+positions the search never sees is fitted on the wrong thing.
 
-    uv run python -m tools.gen_positions --games 200 --out data/positions.txt
+    uv run python -m tools.gen_positions --games 4000 --out data/positions.txt
     uv run python -m tools.gen_positions --from-pgn games.pgn --out data/positions.txt
 
 Positions are deduplicated on the board alone, ignoring move counters, so transpositions
@@ -13,6 +13,7 @@ collapse. Output is one FEN per line, ready for tools/label.py.
 """
 
 import argparse
+import multiprocessing
 import random
 import sys
 from collections.abc import Iterator
@@ -24,10 +25,18 @@ import chess.pgn
 
 from tools.engine import spawn
 
+ENGINE: chess.engine.SimpleEngine | None = None
+
 
 def key(board: chess.Board) -> str:
     """Board, side, castling and en passant, without the move counters."""
     return " ".join(board.fen().split(" ")[:4])
+
+
+def start() -> None:
+    """Runs once per worker. Each keeps its own engine for the life of the pool."""
+    global ENGINE
+    ENGINE = spawn(hash_mb=32)
 
 
 def walk(
@@ -54,6 +63,20 @@ def walk(
         board.push(played)
 
 
+def batch(task: tuple[int, int, int, int, int, int]) -> list[str]:
+    """One worker's share of the games, as FENs."""
+    if ENGINE is None:
+        raise RuntimeError("worker used before its engine was started")
+    seed, games, opening_plies, playout_nodes, max_plies, every = task
+    rng = random.Random(seed)
+    found: list[str] = []
+    for _ in range(games):
+        for board in walk(ENGINE, rng, opening_plies, playout_nodes, max_plies, every):
+            if not board.is_game_over(claim_draw=True):
+                found.append(board.fen())
+    return found
+
+
 def from_pgn(path: Path, every: int) -> Iterator[chess.Board]:
     with path.open(encoding="utf-8", errors="replace") as handle:
         while (game := chess.pgn.read_game(handle)) is not None:
@@ -70,48 +93,51 @@ def main() -> None:
     parser.add_argument("--games", type=int, default=100)
     parser.add_argument("--from-pgn", type=Path)
     parser.add_argument("--opening-plies", type=int, default=8)
-    parser.add_argument("--playout-nodes", type=int, default=20_000)
+    parser.add_argument("--playout-nodes", type=int, default=8_000)
     parser.add_argument("--max-plies", type=int, default=160)
     parser.add_argument("--every", type=int, default=6)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--workers", type=int, default=max(1, multiprocessing.cpu_count() - 2))
     arguments = parser.parse_args()
 
     arguments.out.parent.mkdir(parents=True, exist_ok=True)
     seen: set[str] = set()
-    written = 0
+    kept: list[str] = []
 
-    with arguments.out.open("w", encoding="utf-8") as sink:
-        def keep(board: chess.Board) -> None:
-            nonlocal written
-            if board.is_game_over(claim_draw=True) or key(board) in seen:
-                return
-            seen.add(key(board))
-            sink.write(board.fen() + "\n")
-            written += 1
+    def keep(fen: str) -> None:
+        board = chess.Board(fen)
+        identity = key(board)
+        if identity not in seen:
+            seen.add(identity)
+            kept.append(fen)
 
-        if arguments.from_pgn:
-            for board in from_pgn(arguments.from_pgn, arguments.every):
-                keep(board)
-        else:
-            rng = random.Random(arguments.seed)
-            engine = spawn()
-            try:
-                for game in range(arguments.games):
-                    for board in walk(
-                        engine,
-                        rng,
-                        arguments.opening_plies,
-                        arguments.playout_nodes,
-                        arguments.max_plies,
-                        arguments.every,
-                    ):
-                        keep(board)
-                    progress = f"game {game + 1}/{arguments.games}, {written} positions"
-                    print(progress, file=sys.stderr)
-            finally:
-                engine.close()
+    if arguments.from_pgn:
+        for board in from_pgn(arguments.from_pgn, arguments.every):
+            if not board.is_game_over(claim_draw=True):
+                keep(board.fen())
+    else:
+        workers = max(1, min(arguments.workers, arguments.games))
+        share, spare = divmod(arguments.games, workers)
+        tasks = [
+            (
+                arguments.seed + index,
+                share + (1 if index < spare else 0),
+                arguments.opening_plies,
+                arguments.playout_nodes,
+                arguments.max_plies,
+                arguments.every,
+            )
+            for index in range(workers)
+        ]
+        print(f"{arguments.games} games across {workers} engines", file=sys.stderr)
+        with multiprocessing.Pool(workers, initializer=start) as pool:
+            for done, found in enumerate(pool.imap_unordered(batch, tasks), start=1):
+                for fen in found:
+                    keep(fen)
+                print(f"  worker {done}/{workers}, {len(kept):,} unique", file=sys.stderr)
 
-    print(f"{written} unique positions written to {arguments.out}")
+    arguments.out.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    print(f"{len(kept):,} unique positions written to {arguments.out}")
 
 
 if __name__ == "__main__":

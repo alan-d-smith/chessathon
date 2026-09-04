@@ -8,8 +8,11 @@ across cores because measuring a 20 Elo change needs hundreds of games rather th
 
     uv run python -m tools.match --agent . --opponent baselines/v1 --openings data/openings.txt
 
-The Elo estimate carries a 95% interval. If that interval spans zero the change is unproven,
-which is the number that should decide whether it stays.
+By default the match runs as an SPRT against "no better" versus "worth at least 15 Elo", and
+stops the moment either is established, so a clear result costs a hundred games and only a
+marginal one costs the full suite. Pass --no-sprt to play every game regardless, and --elo0 /
+--elo1 to move the bounds. The Elo estimate carries a 95% interval alongside it; an interval
+that spans zero means the change is unproven whatever the score looks like.
 """
 
 import argparse
@@ -45,6 +48,31 @@ def one(task: tuple[Path, Path, str, bool, int, int]) -> tuple[float, str, str]:
     return (1.0 if won else 0.0), outcome.termination, blame
 
 
+def expected(difference: float) -> float:
+    """The score an agent this many Elo ahead is expected to take."""
+    return 1.0 / (1.0 + 10.0 ** (-difference / 400.0))
+
+
+def llr(wins: int, draws: int, losses: int, elo0: float, elo1: float) -> float:
+    """Log-likelihood ratio between "no better than elo0" and "at least elo1".
+
+    This is what lets a match stop as soon as the answer is known rather than at a round number
+    of games picked in advance. A change that is clearly good crosses the upper bound in a
+    hundred games; one that is clearly bad is rejected just as fast; only the genuinely
+    marginal ones cost a full run, which is exactly where the games are worth spending.
+    """
+    games = wins + draws + losses
+    if games == 0 or (wins == 0 and draws == 0) or (losses == 0 and draws == 0):
+        return 0.0
+    win, draw = wins / games, draws / games
+    score = win + draw / 2.0
+    variance = (win + draw / 4.0) - score * score
+    if variance <= 0.0:
+        return 0.0
+    score0, score1 = expected(elo0), expected(elo1)
+    return games * (score1 - score0) * (2.0 * score - score0 - score1) / (2.0 * variance)
+
+
 def elo(score: float, games: int) -> tuple[float, float]:
     """Elo difference and the half-width of a 95% interval on it."""
     if score <= 0.0:
@@ -65,7 +93,14 @@ def main() -> None:
     parser.add_argument("--openings", type=Path, default=Path("data/openings.txt"))
     parser.add_argument("--base-ms", type=int, default=FAST_BASE_MS)
     parser.add_argument("--increment-ms", type=int, default=FAST_INCREMENT_MS)
-    parser.add_argument("--workers", type=int, default=max(1, multiprocessing.cpu_count() // 3))
+    # Two agent processes per game and a mostly idle pool worker driving them, so concurrency
+    # near half the cores keeps them busy without either side of a game waiting to be scheduled.
+    parser.add_argument(
+        "--workers", type=int, default=max(1, multiprocessing.cpu_count() // 2 - 2)
+    )
+    parser.add_argument("--elo0", type=float, default=0.0, help="SPRT null: no improvement")
+    parser.add_argument("--elo1", type=float, default=15.0, help="SPRT alternative: worth taking")
+    parser.add_argument("--no-sprt", action="store_true", help="play every game regardless")
     arguments = parser.parse_args()
 
     openings = [
@@ -85,10 +120,15 @@ def main() -> None:
     workers = max(1, min(arguments.workers, len(tasks)))
     print(f"{len(tasks)} games from {len(openings)} openings, {workers} at a time")
 
+    # Wald's bounds for a 5% chance each of accepting a bad change or rejecting a good one.
+    upper = math.log(0.95 / 0.05)
+    lower = math.log(0.05 / 0.95)
+
     points = 0.0
     wins = draws = losses = 0
     terminations: dict[str, int] = {}
     faults: dict[str, int] = {}
+    stopped = ""
     with multiprocessing.Pool(workers) as pool:
         results = pool.imap_unordered(one, tasks)
         for done, (score, termination, blame) in enumerate(results, start=1):
@@ -102,15 +142,32 @@ def main() -> None:
             terminations[termination] = terminations.get(termination, 0) + 1
             if blame:
                 faults[f"{blame}:{termination}"] = faults.get(f"{blame}:{termination}", 0) + 1
-            if done % 20 == 0 or done == len(tasks):
-                print(f"  {done}/{len(tasks)}  +{wins} ={draws} -{losses}")
 
-    games = len(tasks)
+            ratio = llr(wins, draws, losses, arguments.elo0, arguments.elo1)
+            if done % 20 == 0 or done == len(tasks):
+                print(f"  {done}/{len(tasks)}  +{wins} ={draws} -{losses}  llr {ratio:+.2f}")
+            if not arguments.no_sprt and done >= 40:
+                if ratio >= upper:
+                    stopped = f"accepted after {done} games, llr {ratio:+.2f} >= {upper:.2f}"
+                    break
+                if ratio <= lower:
+                    stopped = f"rejected after {done} games, llr {ratio:+.2f} <= {lower:.2f}"
+                    break
+        if stopped:
+            pool.terminate()
+
+    games = wins + draws + losses
     score = points / games
     difference, interval = elo(score, games)
     print(f"\n{arguments.agent} vs {arguments.opponent}")
     print(f"+{wins} ={draws} -{losses} over {games} games, score {score:.1%}")
     print(f"elo {difference:+.0f} +/- {interval:.0f} (95%)")
+    if stopped:
+        print(f"sprt: {stopped}")
+    else:
+        ratio = llr(wins, draws, losses, arguments.elo0, arguments.elo1)
+        print(f"sprt: inconclusive over the whole suite, llr {ratio:+.2f} in [{lower:.2f}, "
+              f"{upper:.2f}] for elo0={arguments.elo0:.0f} elo1={arguments.elo1:.0f}")
     verdict = "unproven, the interval spans zero" if abs(difference) < interval else "significant"
     print(f"verdict: {verdict}")
     print("terminations: " + ", ".join(f"{n} {c}" for n, c in sorted(terminations.items())))
