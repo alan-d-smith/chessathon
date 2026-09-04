@@ -93,10 +93,11 @@ def main() -> None:
     parser.add_argument("--openings", type=Path, default=Path("data/openings.txt"))
     parser.add_argument("--base-ms", type=int, default=FAST_BASE_MS)
     parser.add_argument("--increment-ms", type=int, default=FAST_INCREMENT_MS)
-    # Two agent processes per game and a mostly idle pool worker driving them, so concurrency
-    # near half the cores keeps them busy without either side of a game waiting to be scheduled.
+    # Only one side of a game thinks at a time; the other is blocked waiting for a move. A
+    # concurrent game therefore costs about one core, not two, which is why half the cores
+    # left the machine half idle. Four fifths keeps it busy with headroom to spare.
     parser.add_argument(
-        "--workers", type=int, default=max(1, multiprocessing.cpu_count() // 2 - 2)
+        "--workers", type=int, default=max(1, int(multiprocessing.cpu_count() * 0.8))
     )
     parser.add_argument("--elo0", type=float, default=0.0, help="SPRT null: no improvement")
     parser.add_argument("--elo1", type=float, default=15.0, help="SPRT alternative: worth taking")
@@ -116,7 +117,6 @@ def main() -> None:
         for fen in openings
         for as_white in (True, False)
     ]
-    # Two agent processes per game, so a worker per core would oversubscribe by two.
     workers = max(1, min(arguments.workers, len(tasks)))
     print(f"{len(tasks)} games from {len(openings)} openings, {workers} at a time")
 

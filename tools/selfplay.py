@@ -74,8 +74,11 @@ def main() -> None:
     parser.add_argument("--base-ms", type=int, default=4_000)
     parser.add_argument("--increment-ms", type=int, default=40)
     parser.add_argument("--skip-plies", type=int, default=8)
+    # Only one side of a game thinks at a time; the other is blocked waiting for a move. A
+    # concurrent game therefore costs about one core, not two, which is why half the cores
+    # left the machine half idle. Four fifths keeps it busy with headroom to spare.
     parser.add_argument(
-        "--workers", type=int, default=max(1, multiprocessing.cpu_count() // 2 - 2)
+        "--workers", type=int, default=max(1, int(multiprocessing.cpu_count() * 0.8))
     )
     arguments = parser.parse_args()
 

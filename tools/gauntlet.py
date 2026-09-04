@@ -97,8 +97,11 @@ def main() -> None:
         help="also play the outside engines named by WEISS_BIN",
     )
     parser.add_argument("--diverse-depth", type=str, default="", help="depth cap for those")
+    # Only one side of a game thinks at a time; the other is blocked waiting for a move. A
+    # concurrent game therefore costs about one core, not two, which is why half the cores
+    # left the machine half idle. Four fifths keeps it busy with headroom to spare.
     parser.add_argument(
-        "--workers", type=int, default=max(1, multiprocessing.cpu_count() // 2 - 2)
+        "--workers", type=int, default=max(1, int(multiprocessing.cpu_count() * 0.8))
     )
     arguments = parser.parse_args()
 
