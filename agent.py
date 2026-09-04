@@ -20,6 +20,9 @@ import weights
 
 INFINITY: Final = 1 << 20
 MATE: Final = 1 << 16
+# Anything past this is a mate score rather than an evaluation, and has to be handled as a
+# distance rather than a number.
+MATE_BOUND: Final = (1 << 16) - 64
 MAX_DEPTH: Final = 64
 # The search can only stop on a clock check, so this interval is the worst case by which it
 # overruns its budget. 512 nodes costs a few microseconds a second and bounds the overrun to
@@ -405,6 +408,29 @@ def quiesce(board: chess.Board, alpha: int, beta: int) -> int:
     return alpha
 
 
+def to_store(score: int, ply: int) -> int:
+    """Rebase a mate score from "distance from the root" to "distance from this node".
+
+    A mate is scored -MATE + ply, which is only meaningful at the ply that found it. The same
+    position reached at another depth would read that entry as a mate a different number of
+    moves away, so the table stores node-relative distances and converts back on the way out.
+    """
+    if score > MATE_BOUND:
+        return score + ply
+    if score < -MATE_BOUND:
+        return score - ply
+    return score
+
+
+def from_store(score: int, ply: int) -> int:
+    """Undo to_store, putting a mate distance back into the root's frame of reference."""
+    if score > MATE_BOUND:
+        return score - ply
+    if score < -MATE_BOUND:
+        return score + ply
+    return score
+
+
 def has_pieces(board: chess.Board, colour: chess.Color) -> bool:
     """Whether a side still holds a piece beyond pawns, which is what makes zugzwang unlikely."""
     mine = board.occupied_co[colour]
@@ -429,7 +455,8 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int, ply: int) -> 
     key = board._transposition_key()
     stored = transposition.get(key)
     if stored is not None and stored[0] >= depth:
-        _, score, flag, _ = stored
+        score = from_store(stored[1], ply)
+        flag = stored[2]
         if flag == EXACT:
             return score
         if flag == LOWER:
@@ -526,7 +553,7 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int, ply: int) -> 
 
     if len(transposition) < TT_LIMIT:
         flag = EXACT if original < best_score < beta else (LOWER if best_score >= beta else UPPER)
-        transposition[key] = (depth, best_score, flag, best_move)
+        transposition[key] = (depth, to_store(best_score, ply), flag, best_move)
     return best_score
 
 
