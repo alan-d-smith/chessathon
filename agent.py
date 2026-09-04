@@ -16,6 +16,8 @@ from typing import Final
 
 import chess
 
+import weights
+
 INFINITY: Final = 1 << 20
 MATE: Final = 1 << 16
 MAX_DEPTH: Final = 64
@@ -69,111 +71,75 @@ FUTILITY_MARGIN: Final = 150
 PRUNE_MAX_DEPTH: Final = 3
 
 
-def read(rows: str) -> list[int]:
-    """Tables are written rank 8 first, the way a board is drawn. python-chess counts a1 as 0."""
-    values = [int(value) for value in rows.split()]
-    return [values[(7 - rank) * 8 + file] for rank in range(8) for file in range(8)]
-
-
-PAWN_TABLE: Final = read("""
-     0   0   0   0   0   0   0   0
-    50  50  50  50  50  50  50  50
-    10  10  20  30  30  20  10  10
-     5   5  10  25  25  10   5   5
-     0   0   0  20  20   0   0   0
-     5  -5 -10   0   0 -10  -5   5
-     5  10  10 -20 -20  10  10   5
-     0   0   0   0   0   0   0   0
-""")
-KNIGHT_TABLE: Final = read("""
-   -50 -40 -30 -30 -30 -30 -40 -50
-   -40 -20   0   0   0   0 -20 -40
-   -30   0  10  15  15  10   0 -30
-   -30   5  15  20  20  15   5 -30
-   -30   0  15  20  20  15   0 -30
-   -30   5  10  15  15  10   5 -30
-   -40 -20   0   5   5   0 -20 -40
-   -50 -40 -30 -30 -30 -30 -40 -50
-""")
-BISHOP_TABLE: Final = read("""
-   -20 -10 -10 -10 -10 -10 -10 -20
-   -10   0   0   0   0   0   0 -10
-   -10   0   5  10  10   5   0 -10
-   -10   5   5  10  10   5   5 -10
-   -10   0  10  10  10  10   0 -10
-   -10  10  10  10  10  10  10 -10
-   -10   5   0   0   0   0   5 -10
-   -20 -10 -10 -10 -10 -10 -10 -20
-""")
-ROOK_TABLE: Final = read("""
-     0   0   0   0   0   0   0   0
-     5  10  10  10  10  10  10   5
-    -5   0   0   0   0   0   0  -5
-    -5   0   0   0   0   0   0  -5
-    -5   0   0   0   0   0   0  -5
-    -5   0   0   0   0   0   0  -5
-    -5   0   0   0   0   0   0  -5
-     0   0   0   5   5   0   0   0
-""")
-QUEEN_TABLE: Final = read("""
-   -20 -10 -10  -5  -5 -10 -10 -20
-   -10   0   0   0   0   0   0 -10
-   -10   0   5   5   5   5   0 -10
-    -5   0   5   5   5   5   0  -5
-     0   0   5   5   5   5   0  -5
-   -10   5   5   5   5   5   0 -10
-   -10   0   5   0   0   0   0 -10
-   -20 -10 -10  -5  -5 -10 -10 -20
-""")
-KING_MIDGAME: Final = read("""
-   -30 -40 -40 -50 -50 -40 -40 -30
-   -30 -40 -40 -50 -50 -40 -40 -30
-   -30 -40 -40 -50 -50 -40 -40 -30
-   -30 -40 -40 -50 -50 -40 -40 -30
-   -20 -30 -30 -40 -40 -30 -30 -20
-   -10 -20 -20 -20 -20 -20 -20 -10
-    20  20   0   0   0   0  20  20
-    20  30  10   0   0  10  30  20
-""")
-KING_ENDGAME: Final = read("""
-   -50 -40 -30 -20 -20 -30 -40 -50
-   -30 -20 -10   0   0 -10 -20 -30
-   -30 -10  20  30  30  20 -10 -30
-   -30 -10  30  40  40  30 -10 -30
-   -30 -10  30  40  40  30 -10 -30
-   -30 -10  20  30  30  20 -10 -30
-   -30 -30   0   0   0   0 -30 -30
-   -50 -30 -30 -30 -30 -30 -30 -50
-""")
-
 # Mirroring once at import saves a square_mirror call in the hottest loop there is.
 MIRROR: Final = [chess.square_mirror(square) for square in range(64)]
 
+# Structural terms, in the order the fitted weights arrive in. Material and placement alone
+# cannot tell a passed pawn from a blocked one, and at this depth the search will not discover
+# the difference on its own.
+DOUBLED: Final = 0
+ISOLATED: Final = 1
+PASSED_2: Final = 2
+BISHOP_PAIR: Final = 8
+ROOK_OPEN: Final = 9
+ROOK_SEMI: Final = 10
+SHIELD_MISSING: Final = 11
+STRUCTURAL_NAMES: Final = (
+    "doubled",
+    "isolated",
+    "passed_2",
+    "passed_3",
+    "passed_4",
+    "passed_5",
+    "passed_6",
+    "passed_7",
+    "bishop_pair",
+    "rook_open",
+    "rook_semi",
+    "shield_missing",
+)
+SHIELD_WANTED: Final = 3
 
-def fold(table: list[int], value: int) -> tuple[list[int], list[int]]:
-    """Fold material into the square table, once per colour, so evaluation is one lookup."""
-    return (
-        [value + table[square] for square in range(64)],
-        [value + table[MIRROR[square]] for square in range(64)],
+
+def from_rows(values: list[int]) -> list[int]:
+    """weights.py writes tables rank 8 first, as a board is drawn. python-chess counts a1 as 0."""
+    return [values[(7 - rank) * 8 + file] for rank in range(8) for file in range(8)]
+
+
+def blend(midgame: list[int], endgame: list[int], phase: int) -> list[int]:
+    return [
+        (midgame[square] * phase + endgame[square] * (TOTAL_PHASE - phase)) // TOTAL_PHASE
+        for square in range(64)
+    ]
+
+
+PAIRS: Final = (
+    (from_rows(weights.PAWN_MG), from_rows(weights.PAWN_EG)),
+    (from_rows(weights.KNIGHT_MG), from_rows(weights.KNIGHT_EG)),
+    (from_rows(weights.BISHOP_MG), from_rows(weights.BISHOP_EG)),
+    (from_rows(weights.ROOK_MG), from_rows(weights.ROOK_EG)),
+    (from_rows(weights.QUEEN_MG), from_rows(weights.QUEEN_EG)),
+    (from_rows(weights.KING_MG), from_rows(weights.KING_EG)),
+)
+
+# Every term is tapered between a midgame and an endgame value, but phase only takes 25 values,
+# so all 25 blends are built once at import. Tapering everything then costs the search nothing:
+# evaluation still does one table lookup per piece, exactly as it did untapered.
+TABLES_W: Final = [
+    [blend(midgame, endgame, phase) for midgame, endgame in PAIRS]
+    for phase in range(TOTAL_PHASE + 1)
+]
+TABLES_B: Final = [
+    [[table[MIRROR[square]] for square in range(64)] for table in tables] for tables in TABLES_W
+]
+STRUCTURAL: Final = [
+    tuple(
+        (weights.STRUCTURAL_MG[name] * phase + weights.STRUCTURAL_EG[name] * (TOTAL_PHASE - phase))
+        // TOTAL_PHASE
+        for name in STRUCTURAL_NAMES
     )
-
-
-PAWN_W, PAWN_B = fold(PAWN_TABLE, VALUE[chess.PAWN])
-KNIGHT_W, KNIGHT_B = fold(KNIGHT_TABLE, VALUE[chess.KNIGHT])
-BISHOP_W, BISHOP_B = fold(BISHOP_TABLE, VALUE[chess.BISHOP])
-ROOK_W, ROOK_B = fold(ROOK_TABLE, VALUE[chess.ROOK])
-QUEEN_W, QUEEN_B = fold(QUEEN_TABLE, VALUE[chess.QUEEN])
-KING_MG_B: Final = [KING_MIDGAME[MIRROR[square]] for square in range(64)]
-KING_EG_B: Final = [KING_ENDGAME[MIRROR[square]] for square in range(64)]
-
-# Structural terms. Material and placement alone cannot tell a passed pawn from a blocked one,
-# and at this depth the search will not discover the difference on its own.
-BISHOP_PAIR: Final = 30
-DOUBLED_PENALTY: Final = 12
-ISOLATED_PENALTY: Final = 14
-ROOK_OPEN_FILE: Final = 18
-ROOK_SEMI_OPEN_FILE: Final = 9
-PASSED_BONUS: Final = (0, 5, 12, 22, 40, 70, 115, 0)
+    for phase in range(TOTAL_PHASE + 1)
+]
 
 FILE_OF: Final = [chess.square_file(square) for square in range(64)]
 RANK_OF: Final = [chess.square_rank(square) for square in range(64)]
@@ -195,12 +161,31 @@ def ahead_mask(square: int, colour: chess.Color) -> int:
     return files & ahead
 
 
-PASSED_W: Final = [ahead_mask(square, chess.WHITE) for square in range(64)]
-PASSED_B: Final = [ahead_mask(square, chess.BLACK) for square in range(64)]
+def shield_mask(square: int, colour: chess.Color) -> int:
+    """The two ranks directly in front of a king, across its own and adjacent files."""
+    file = FILE_OF[square]
+    files = chess.BB_FILES[file] | NEIGHBOUR_FILES[file]
+    rank = RANK_OF[square]
+    steps = (rank + 1, rank + 2) if colour else (rank - 1, rank - 2)
+    ahead = 0
+    for step in steps:
+        if 0 <= step <= 7:
+            ahead |= chess.BB_RANKS[step]
+    return files & ahead
 
-# Pawn structure changes on maybe one move in six, so the same skeleton is evaluated over and
-# over. Keying a cache on the two pawn bitboards turns most of that work into a dict lookup.
-pawn_cache: dict[tuple[int, int], int] = {}
+
+PASSED: Final = (
+    [ahead_mask(square, chess.BLACK) for square in range(64)],
+    [ahead_mask(square, chess.WHITE) for square in range(64)],
+)
+SHIELD: Final = (
+    [shield_mask(square, chess.BLACK) for square in range(64)],
+    [shield_mask(square, chess.WHITE) for square in range(64)],
+)
+
+# Pawn structure changes on maybe one move in six, so the same skeleton is counted over and
+# over. The cache holds counts rather than a score, so it stays valid at every phase.
+pawn_cache: dict[tuple[int, int], tuple[int, ...]] = {}
 PAWN_CACHE_LIMIT: Final = 200_000
 
 EXACT: Final = 0
@@ -252,37 +237,44 @@ def scan(mask: int, table: list[int]) -> int:
     return total
 
 
-def pawn_score(white_pawns: int, black_pawns: int) -> int:
-    """Doubled, isolated and passed pawns, from White's point of view."""
+def pawn_counts(white_pawns: int, black_pawns: int) -> tuple[int, ...]:
+    """Net doubled, isolated and passed-by-rank counts, White positive.
+
+    Counts, not a score, because the weights they are multiplied by depend on the phase and the
+    pawns do not. One cache then serves every phase the same skeleton turns up in.
+    """
     cached = pawn_cache.get((white_pawns, black_pawns))
     if cached is not None:
         return cached
 
-    score = 0
-    for pawns, enemy, passed_masks, sign in (
-        (white_pawns, black_pawns, PASSED_W, 1),
-        (black_pawns, white_pawns, PASSED_B, -1),
+    tally = [0] * len(STRUCTURAL_NAMES)
+    for colour, mine, theirs, sign in (
+        (chess.WHITE, white_pawns, black_pawns, 1),
+        (chess.BLACK, black_pawns, white_pawns, -1),
     ):
         for file in range(8):
-            count = (pawns & chess.BB_FILES[file]).bit_count()
+            count = (mine & chess.BB_FILES[file]).bit_count()
             if count > 1:
-                score -= sign * DOUBLED_PENALTY * (count - 1)
+                tally[DOUBLED] += sign * (count - 1)
 
-        remaining = pawns
+        remaining = mine
+        passed_masks = PASSED[colour]
         while remaining:
             lowest = remaining & -remaining
             square = lowest.bit_length() - 1
             remaining ^= lowest
-            if not pawns & NEIGHBOUR_FILES[FILE_OF[square]]:
-                score -= sign * ISOLATED_PENALTY
-            if not enemy & passed_masks[square]:
-                # Rank counted from the pawn's own side, so both colours read the same table.
-                advance = RANK_OF[square] if sign > 0 else 7 - RANK_OF[square]
-                score += sign * PASSED_BONUS[advance]
+            if not mine & NEIGHBOUR_FILES[FILE_OF[square]]:
+                tally[ISOLATED] += sign
+            if not theirs & passed_masks[square]:
+                # Rank counted from the pawn's own side, so both colours share one set of weights.
+                advance = RANK_OF[square] if colour == chess.WHITE else 7 - RANK_OF[square]
+                if 2 <= advance <= 7:
+                    tally[PASSED_2 + advance - 2] += sign
 
+    counts = tuple(tally)
     if len(pawn_cache) < PAWN_CACHE_LIMIT:
-        pawn_cache[(white_pawns, black_pawns)] = score
-    return score
+        pawn_cache[(white_pawns, black_pawns)] = counts
+    return counts
 
 
 def evaluate(board: chess.Board) -> int:
@@ -290,55 +282,57 @@ def evaluate(board: chess.Board) -> int:
     white = board.occupied_co[chess.WHITE]
     black = board.occupied_co[chess.BLACK]
     pawns, knights = board.pawns, board.knights
-    bishops, rooks, queens = board.bishops, board.rooks, board.queens
+    bishops, rooks, queens, kings = board.bishops, board.rooks, board.queens, board.kings
+
+    # Popcounts beat counting squares one at a time, and the phase is only ever a weighted count.
+    phase = (knights | bishops).bit_count() + rooks.bit_count() * 2 + queens.bit_count() * 4
+    phase = min(phase, TOTAL_PHASE)
+    ours, theirs = TABLES_W[phase], TABLES_B[phase]
 
     score = (
-        scan(pawns & white, PAWN_W)
-        - scan(pawns & black, PAWN_B)
-        + scan(knights & white, KNIGHT_W)
-        - scan(knights & black, KNIGHT_B)
-        + scan(bishops & white, BISHOP_W)
-        - scan(bishops & black, BISHOP_B)
-        + scan(rooks & white, ROOK_W)
-        - scan(rooks & black, ROOK_B)
-        + scan(queens & white, QUEEN_W)
-        - scan(queens & black, QUEEN_B)
+        scan(pawns & white, ours[0])
+        - scan(pawns & black, theirs[0])
+        + scan(knights & white, ours[1])
+        - scan(knights & black, theirs[1])
+        + scan(bishops & white, ours[2])
+        - scan(bishops & black, theirs[2])
+        + scan(rooks & white, ours[3])
+        - scan(rooks & black, theirs[3])
+        + scan(queens & white, ours[4])
+        - scan(queens & black, theirs[4])
+        + scan(kings & white, ours[5])
+        - scan(kings & black, theirs[5])
     )
 
-    score += pawn_score(pawns & white, pawns & black)
+    weight = STRUCTURAL[phase]
+    for term, count in enumerate(pawn_counts(pawns & white, pawns & black)):
+        if count:
+            score += count * weight[term]
 
     # Two bishops cover both colour complexes, which is worth more than the pieces separately.
     if (bishops & white).bit_count() >= 2:
-        score += BISHOP_PAIR
+        score += weight[BISHOP_PAIR]
     if (bishops & black).bit_count() >= 2:
-        score -= BISHOP_PAIR
+        score -= weight[BISHOP_PAIR]
 
-    # A rook is worth having where it can actually see down the board.
-    for rook_set, sign in ((rooks & white, 1), (rooks & black, -1)):
-        remaining = rook_set
+    for colour, mine, sign in ((chess.WHITE, white, 1), (chess.BLACK, black, -1)):
+        # A rook is worth having where it can actually see down the board.
+        remaining = rooks & mine
         while remaining:
             lowest = remaining & -remaining
             remaining ^= lowest
             file_mask = chess.BB_FILES[FILE_OF[lowest.bit_length() - 1]]
             if not pawns & file_mask:
-                score += sign * ROOK_OPEN_FILE
-            elif not (pawns & (white if sign > 0 else black)) & file_mask:
-                score += sign * ROOK_SEMI_OPEN_FILE
+                score += sign * weight[ROOK_OPEN]
+            elif not pawns & mine & file_mask:
+                score += sign * weight[ROOK_SEMI]
 
-    # Popcounts beat counting squares one at a time, and the phase is only ever a weighted count.
-    phase = (knights | bishops).bit_count() + rooks.bit_count() * 2 + queens.bit_count() * 4
-    phase = min(phase, TOTAL_PHASE)
-    endgame = TOTAL_PHASE - phase
-
-    kings = board.kings
-    white_king = kings & white
-    if white_king:
-        square = white_king.bit_length() - 1
-        score += (KING_MIDGAME[square] * phase + KING_ENDGAME[square] * endgame) // TOTAL_PHASE
-    black_king = kings & black
-    if black_king:
-        square = black_king.bit_length() - 1
-        score -= (KING_MG_B[square] * phase + KING_EG_B[square] * endgame) // TOTAL_PHASE
+        king = kings & mine
+        if king:
+            square = king.bit_length() - 1
+            present = (pawns & mine & SHIELD[colour][square]).bit_count()
+            missing = SHIELD_WANTED - min(present, SHIELD_WANTED)
+            score += sign * missing * weight[SHIELD_MISSING]
 
     return score if board.turn == chess.WHITE else -score
 
