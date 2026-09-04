@@ -46,7 +46,8 @@ and they change, so fetch them before you rely on a number.
   ignored, so an import outside that stack crashes on the platform even when it works locally.
   Additions can be requested at hello@aichessathon.com.
 - Native binaries in the zip are rejected. Ship Python source. Model weights like `.onnx`,
-  `.safetensors` and `.pt` are fine, and any model shipped must be one the team trained.
+  `.safetensors` and `.pt` are fine. The network has to be one the team trained, and training it
+  on positions an engine labelled is a normal way to do that.
 - numba is how Python gets fast here. Warm every jitted function once at import so compilation
   lands in the init budget, not on the clock. Cython does not work on the platform.
 - `print` is safe. The runner points file descriptor 1 at stderr before importing the agent, so
@@ -55,10 +56,11 @@ and they change, so fetch them before you rely on a number.
 
 ## Do not
 
-- Do not use Stockfish, Lc0, Maia, or any existing engine inside the submission, including a
-  pip package that embeds one. It is an instant disqualification and it is checked after the
-  fact. Training on data an engine annotated is allowed; the ban covers what ships and runs
-  inside the zip.
+- Do not ship someone else's engine or someone else's network. Stockfish, Lc0, Maia, a port or
+  translation of one, and a published net that was fine-tuned or re-exported all count. This is
+  checked after games are played, not only at upload.
+- Do not ship a table of engine moves or evaluations for the agent to look up while it plays.
+  That is an engine in another shape. Opening books and endgame tablebases are fine.
 - Do not add network calls, subprocess calls to external binaries, or anything that reads outside
   the agent directory and `/tmp`.
 - Do not obfuscate. What ships has to be source a judge can read.
