@@ -48,13 +48,23 @@ def binary() -> str:
     raise RuntimeError("no stockfish binary found; set SF_BIN to its path")
 
 
-def options() -> dict[str, object]:
-    """One core and a small hash, so a game against it measures search, not hardware."""
-    chosen: dict[str, object] = {"Threads": 1, "Hash": HASH_MB}
+def options(supported: set[str]) -> dict[str, object]:
+    """One core and a small hash, so a game against it measures search, not hardware.
+
+    Only options the engine actually advertises are set, so this drives any UCI engine and not
+    only Stockfish. Measuring against one opponent family risks tuning to its particular
+    weaknesses, and an engine that has never heard of UCI_Elo should still be playable.
+    """
+    chosen: dict[str, object] = {}
+    if "Threads" in supported:
+        chosen["Threads"] = 1
+    if "Hash" in supported:
+        chosen["Hash"] = HASH_MB
+
     skill = os.environ.get("SF_SKILL")
-    if skill is not None:
+    if skill is not None and "Skill Level" in supported:
         chosen["Skill Level"] = int(skill)
-    else:
+    elif "UCI_LimitStrength" in supported and "UCI_Elo" in supported:
         chosen["UCI_LimitStrength"] = True
         chosen["UCI_Elo"] = int(os.environ.get("SF_ELO", "1320"))
     return chosen
@@ -74,7 +84,7 @@ def limit(time_left_ms: int) -> chess.engine.Limit:
 # Start once, at import, inside the init budget, and keep it for the whole game. Exactly the
 # lifecycle a real agent gets, so the clock it consumes is the clock it would really consume.
 engine = chess.engine.SimpleEngine.popen_uci(binary())
-engine.configure(options())
+engine.configure(options(set(engine.options)))
 atexit.register(engine.close)
 
 
