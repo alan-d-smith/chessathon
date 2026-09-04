@@ -97,8 +97,33 @@ with a 95% interval, and names which side was responsible for any flag or crash,
 opponent losing on time and our agent losing on time read identically in a score line and mean
 opposite things. `data/openings.txt` is committed so comparisons stay on one yardstick.
 
-`baselines/v1` through `v4` are frozen previous versions. "Better than my last one" is the only
-comparison that matters, so each accepted change becomes the next opponent.
+`baselines/v1` through `v5` are frozen previous versions, and each accepted change becomes the
+next opponent.
+
+That comparison alone is not enough, though, and it is worth being precise about why. A match
+against your own previous version answers "is this better than what I had", not "is this
+stronger". Two versions sharing an evaluation blind spot both fall into it, so a change can win
+its self-play match by exploiting a weakness the next opponent will not have. Measured here,
+that gap was a factor of two: the self-play chain put v1 to v4 at +290 Elo, and the same two
+versions on an outside ladder were 1803 and 1933, about +130.
+
+So every change is judged on three axes, and only a change that moves all three is believed:
+
+```
+uv run python -m tools.match    --agent . --opponent baselines/v5          # fast, biased
+uv run python -m tools.gauntlet --agent . --games 40 --base-ms 30000       # absolute anchor
+uv run python -m tools.gauntlet --agent . --diverse                        # a different engine
+```
+
+`tools/gauntlet.py` plays a Stockfish ladder and reports the rating each rung implies. With
+`--diverse` it also plays whatever outside engine `WEISS_BIN` points at, depth-limited to about
+our own strength; that rung claims no rating, because the point of it is only whether a gain
+shows up against an engine that shares no code with the one we tuned against.
+
+Outside engines are limited by **depth, not nodes**. `go nodes` is optional in the UCI spec and
+an engine that ignores it never replies, which shows up as the opponent losing every game on
+time. That is why the fault line names which side broke: a 100% score against a strong engine is
+far more likely to be a broken harness than a breakthrough, and it was.
 
 ## Fitting the evaluation
 

@@ -50,6 +50,28 @@ def is_quiet(board: chess.Board, best: str | None) -> bool:
     return not board.is_capture(move) and move.promotion is None
 
 
+def load_outcomes(path: Path, limit: int | None) -> tuple[list[str], list[float]]:
+    """Positions labelled by how their game finished, already on the 0..1 scale a score lives on.
+
+    No sigmoid conversion: a result is a probability rather than an opinion in centipawns, which
+    is the whole point of using it. Far noisier per position than an engine label, and far
+    harder to fool, because nothing here has a view about chess except what won.
+    """
+    fens: list[str] = []
+    targets: list[float] = []
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            fens.append(row["fen"])
+            targets.append(float(row["result"]))
+            if limit and len(fens) >= limit:
+                break
+    return fens, targets
+
+
 def load(path: Path, limit: int | None, quiet_only: bool = False) -> tuple[list[str], list[float]]:
     """Positions and their labels, as centipawns from White's point of view."""
     fens: list[str] = []
@@ -188,16 +210,26 @@ def main() -> None:
         action="store_true",
         help="skip checks and positions whose best move is a capture",
     )
+    parser.add_argument(
+        "--outcomes",
+        action="store_true",
+        help="the data is {fen, result} from played games rather than engine evaluations",
+    )
     arguments = parser.parse_args()
 
     torch.set_num_threads(max(1, torch.get_num_threads()))
-    fens, targets = load(arguments.data, arguments.limit, arguments.quiet_only)
+    if arguments.outcomes:
+        fens, targets = load_outcomes(arguments.data, arguments.limit)
+    else:
+        fens, targets = load(arguments.data, arguments.limit, arguments.quiet_only)
     print(f"{len(fens):,} labelled positions")
     if len(fens) < 1000:
         raise SystemExit("not enough labelled positions to fit anything trustworthy")
 
     matrix = extract(fens)
-    wanted = torch.sigmoid(torch.tensor(targets, dtype=torch.float32) * SCALE)
+    scores = torch.tensor(targets, dtype=torch.float32)
+    # Game results are already the thing the model predicts; centipawns need squashing onto it.
+    wanted = scores if arguments.outcomes else torch.sigmoid(scores * SCALE)
     weights = initial().clone().requires_grad_(True)
 
     # A holdout the fit never sees, so an improving training loss with a worsening holdout
