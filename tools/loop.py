@@ -148,6 +148,16 @@ def build_candidate(source: Path, net: Path) -> None:
     shutil.copy(net, CANDIDATE / "weights" / "net.npz")
 
 
+def kill_leftovers() -> None:
+    """Clear anything an abandoned round left running, so the next one starts clean."""
+    if sys.platform != "win32":
+        return
+    for image in ("stockfish-windows-x86-64-avx2.exe",):
+        subprocess.run(
+            ["taskkill", "/F", "/IM", image], capture_output=True, check=False
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the improvement loop until stopped.")
     parser.add_argument("--rounds", type=int, default=100)
@@ -223,118 +233,124 @@ def main() -> None:
     note(f"loop starting: {arguments.rounds} rounds, {arguments.games} games a round")
 
     for round_number in range(1, arguments.rounds + 1):
-        started = time.monotonic()
-        # The champion plays its own games and every position in them is kept, tagged with how
-        # that game finished. This is the part that makes it self-play rather than distillation:
-        # the training signal comes from what actually won, not only from what Stockfish thinks.
-        note(f"round {round_number}: the champion plays {arguments.games} games")
-        player = arguments.play_agent or CHAMPION
-        code, _ = run(
-            [
-                "tools.selfplay",
-                "--white", str(player),
-                "--black", str(player),
-                "--games", str(arguments.games),
-                "--workers", str(arguments.workers),
-                "--openings", str(arguments.openings),
-                "--out", str(OUTCOMES),
-                "--fens", str(POOL),
-                "--append",
-                "--base-ms", str(arguments.play_base_ms),
-                "--increment-ms", str(arguments.play_base_ms // 100),
-            ],
-            limit=arguments.stage_limit,
-        )
-        if code != 0 or not POOL.is_file():
-            note(f"round {round_number}: self-play failed, skipping round")
-            continue
-        played = sum(1 for _ in OUTCOMES.open(encoding="utf-8"))
-        note(f"round {round_number}: {played:,} positions from games played so far")
+        try:
+            started = time.monotonic()
+            # The champion plays its own games and every position in them is kept, tagged with how
+            # that game finished. This is the part that makes it self-play rather than distillation:
+            # the training signal comes from what actually won, not only from what Stockfish thinks.
+            note(f"round {round_number}: the champion plays {arguments.games} games")
+            player = arguments.play_agent or CHAMPION
+            code, _ = run(
+                [
+                    "tools.selfplay",
+                    "--white", str(player),
+                    "--black", str(player),
+                    "--games", str(arguments.games),
+                    "--workers", str(arguments.workers),
+                    "--openings", str(arguments.openings),
+                    "--out", str(OUTCOMES),
+                    "--fens", str(POOL),
+                    "--append",
+                    "--base-ms", str(arguments.play_base_ms),
+                    "--increment-ms", str(arguments.play_base_ms // 100),
+                ],
+                limit=arguments.stage_limit,
+            )
+            if code != 0 or not POOL.is_file():
+                note(f"round {round_number}: self-play failed, skipping round")
+                continue
+            played = sum(1 for _ in OUTCOMES.open(encoding="utf-8"))
+            note(f"round {round_number}: {played:,} positions from games played so far")
 
-        note(f"round {round_number}: labelling")
-        # Appends and skips what it already has, so the pool grows across rounds.
-        code, _ = run(
-            [
-                "tools.label",
-                "--in", str(POOL),
-                "--out", str(LABELS),
-                "--nodes", str(arguments.nodes),
-                "--workers", str(arguments.workers),
-                "--hash-mb", "32",
-            ],
-            limit=arguments.stage_limit,
-        )
-        if code != 0:
-            note(f"round {round_number}: labelling failed, skipping round")
-            continue
-        total = sum(1 for _ in LABELS.open(encoding="utf-8"))
-        note(f"round {round_number}: {total:,} labelled positions in the pool")
+            note(f"round {round_number}: labelling")
+            # Appends and skips what it already has, so the pool grows across rounds.
+            code, _ = run(
+                [
+                    "tools.label",
+                    "--in", str(POOL),
+                    "--out", str(LABELS),
+                    "--nodes", str(arguments.nodes),
+                    "--workers", str(arguments.workers),
+                    "--hash-mb", "32",
+                ],
+                limit=arguments.stage_limit,
+            )
+            if code != 0:
+                note(f"round {round_number}: labelling failed, skipping round")
+                continue
+            total = sum(1 for _ in LABELS.open(encoding="utf-8"))
+            note(f"round {round_number}: {total:,} labelled positions in the pool")
 
-        note(f"round {round_number}: training")
-        code, output = run(
-            [
-                "tools.nnue",
-                "--data", str(LABELS),
-                "--out", str(NET),
-                "--hidden", str(arguments.hidden),
-                "--epochs", str(arguments.epochs),
-                "--rate", "3e-3",
-                "--priority", str(arguments.priority),
-                # Both signals: the engine score for precision, the game result for truth.
-                "--outcomes", str(OUTCOMES),
-                "--outcome-weight", str(arguments.outcome_weight),
-                *(["--residual"] if arguments.residual else []),
-                *(["--warm", str(BEST)] if BEST.is_file() else []),
-            ],
-            quiet=True,
-            python=arguments.train_python,
-            limit=arguments.stage_limit,
-        )
-        if code != 0 or not NET.is_file():
-            note(f"round {round_number}: training failed, skipping round")
-            continue
-        holdout = [line for line in output.splitlines() if "best holdout" in line]
-        note(f"round {round_number}: {holdout[-1].strip() if holdout else 'trained'}")
+            note(f"round {round_number}: training")
+            code, output = run(
+                [
+                    "tools.nnue",
+                    "--data", str(LABELS),
+                    "--out", str(NET),
+                    "--hidden", str(arguments.hidden),
+                    "--epochs", str(arguments.epochs),
+                    "--rate", "3e-3",
+                    "--priority", str(arguments.priority),
+                    # Both signals: the engine score for precision, the game result for truth.
+                    "--outcomes", str(OUTCOMES),
+                    "--outcome-weight", str(arguments.outcome_weight),
+                    *(["--residual"] if arguments.residual else []),
+                    *(["--warm", str(BEST)] if BEST.is_file() else []),
+                ],
+                quiet=True,
+                python=arguments.train_python,
+                limit=arguments.stage_limit,
+            )
+            if code != 0 or not NET.is_file():
+                note(f"round {round_number}: training failed, skipping round")
+                continue
+            holdout = [line for line in output.splitlines() if "best holdout" in line]
+            note(f"round {round_number}: {holdout[-1].strip() if holdout else 'trained'}")
 
-        note(f"round {round_number}: playing the champion")
-        build_candidate(CHAMPION, NET)
-        code, output = run(
-            [
-                "tools.match",
-                "--agent", str(CANDIDATE),
-                "--opponent", str(CHAMPION),
-                "--openings", "data/openings.txt",
-            ],
-            quiet=True,
-            limit=arguments.stage_limit,
-        )
-        verdict = [line for line in output.splitlines() if line.startswith(("elo ", "sprt:"))]
-        for line in verdict:
-            note(f"round {round_number}: {line.strip()}")
+            note(f"round {round_number}: playing the champion")
+            build_candidate(CHAMPION, NET)
+            code, output = run(
+                [
+                    "tools.match",
+                    "--agent", str(CANDIDATE),
+                    "--opponent", str(CHAMPION),
+                    "--openings", "data/openings.txt",
+                ],
+                quiet=True,
+                limit=arguments.stage_limit,
+            )
+            verdict = [line for line in output.splitlines() if line.startswith(("elo ", "sprt:"))]
+            for line in verdict:
+                note(f"round {round_number}: {line.strip()}")
 
-        # Keep the best candidate measured, not the most recent one trained, and start the next
-        # round from it. Round 2 fitted the labels better than round 1 and played 38 Elo worse,
-        # which is exactly the case where following the training loss walks downhill.
-        measured = elo_of(verdict)
-        if measured is not None:
-            previous = read_best()
-            if measured > previous:
-                shutil.copy(NET, BEST)
-                BEST_SCORE.write_text(f"{measured:.1f}" + chr(10), encoding="utf-8")
-                note(f"round {round_number}: best candidate so far at {measured:+.0f} elo")
+            # Keep the best candidate measured, not the most recent one trained, and start the next
+            # round from it. Round 2 fitted the labels better than round 1 and played 38 Elo worse,
+            # which is exactly the case where following the training loss walks downhill.
+            measured = elo_of(verdict)
+            if measured is not None:
+                previous = read_best()
+                if measured > previous:
+                    shutil.copy(NET, BEST)
+                    BEST_SCORE.write_text(f"{measured:.1f}" + chr(10), encoding="utf-8")
+                    note(f"round {round_number}: best candidate so far at {measured:+.0f} elo")
+                else:
+                    note(f"round {round_number}: keeping the {previous:+.0f} elo net to build on")
+
+            if any("accepted" in line for line in verdict):
+                shutil.copy(NET, Path("data/nets") / f"champion_r{round_number}.npz")
+                (CHAMPION / "weights").mkdir(parents=True, exist_ok=True)
+                shutil.copy(NET, CHAMPION / "weights" / "net.npz")
+                shutil.copy(CANDIDATE / "agent.py", CHAMPION / "agent.py")
+                note(f"round {round_number}: PROMOTED, the champion now uses the network")
             else:
-                note(f"round {round_number}: keeping the {previous:+.0f} elo net to build on")
+                note(f"round {round_number}: rejected, champion unchanged")
 
-        if any("accepted" in line for line in verdict):
-            shutil.copy(NET, Path("data/nets") / f"champion_r{round_number}.npz")
-            (CHAMPION / "weights").mkdir(parents=True, exist_ok=True)
-            shutil.copy(NET, CHAMPION / "weights" / "net.npz")
-            shutil.copy(CANDIDATE / "agent.py", CHAMPION / "agent.py")
-            note(f"round {round_number}: PROMOTED, the champion now uses the network")
-        else:
-            note(f"round {round_number}: rejected, champion unchanged")
-
-        note(f"round {round_number}: done in {(time.monotonic() - started) / 60:.1f} min")
+            note(f"round {round_number}: done in {(time.monotonic() - started) / 60:.1f} min")
+        # Any escape here would end a run meant to last until somebody stops it. A round
+        # that dies for its own reasons should cost that round, not the night.
+        except Exception as failure:
+            note(f"round {round_number}: abandoned, {type(failure).__name__}: {failure}")
+            kill_leftovers()
 
 
 if __name__ == "__main__":
