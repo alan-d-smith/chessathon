@@ -98,9 +98,24 @@ def main() -> None:
 
     print(f"{arguments.count} openings across {workers} engines", file=sys.stderr)
     seen: set[str] = set()
-    kept: list[str] = []
+    written = 0
     tried = 0
-    with multiprocessing.Pool(workers, initializer=start) as pool:
+
+    # Most candidates are rejected, so this is expensive engine time. Finished work is flushed
+    # as it arrives and an existing file is resumed, rather than held to the end where an
+    # interruption would take all of it.
+    if arguments.out.is_file():
+        with arguments.out.open(encoding="utf-8") as existing:
+            for line in existing:
+                if line.strip():
+                    seen.add(" ".join(line.strip().split(" ")[:4]))
+                    written += 1
+        print(f"resuming with {written} openings already on disk", file=sys.stderr)
+
+    with (
+        arguments.out.open("a", encoding="utf-8") as sink,
+        multiprocessing.Pool(workers, initializer=start) as pool,
+    ):
         for done, (found, attempts) in enumerate(pool.imap_unordered(batch, tasks), start=1):
             tried += attempts
             for fen in found:
@@ -108,11 +123,12 @@ def main() -> None:
                 identity = " ".join(fen.split(" ")[:4])
                 if identity not in seen:
                     seen.add(identity)
-                    kept.append(fen)
-            print(f"  worker {done}/{workers}, {len(kept)} unique", file=sys.stderr)
+                    sink.write(fen + "\n")
+                    written += 1
+            sink.flush()
+            print(f"  worker {done}/{workers}, {written} unique", file=sys.stderr)
 
-    arguments.out.write_text("\n".join(kept) + "\n", encoding="utf-8")
-    print(f"{len(kept)} balanced openings written to {arguments.out} ({tried} positions tried)")
+    print(f"{written} balanced openings in {arguments.out} ({tried} positions tried)")
 
 
 if __name__ == "__main__":

@@ -104,13 +104,28 @@ def main() -> None:
 
     arguments.out.parent.mkdir(parents=True, exist_ok=True)
     seen: set[str] = set()
-    kept: list[str] = []
+    written = 0
+
+    # Resume rather than restart. Generation is the slowest stage in the loop, and holding
+    # everything in memory until the end once cost a twenty minute run to a single interrupt.
+    if arguments.out.is_file():
+        with arguments.out.open(encoding="utf-8") as existing:
+            for line in existing:
+                fen = line.strip()
+                if fen:
+                    seen.add(" ".join(fen.split(" ")[:4]))
+                    written += 1
+        print(f"resuming with {written:,} positions already on disk", file=sys.stderr)
+
+    sink = arguments.out.open("a", encoding="utf-8")
 
     def keep(fen: str) -> None:
+        nonlocal written
         identity = " ".join(fen.split(" ")[:4])
         if identity not in seen:
             seen.add(identity)
-            kept.append(fen)
+            sink.write(fen + "\n")
+            written += 1
 
     if arguments.from_pgn:
         for board in from_pgn(arguments.from_pgn, arguments.every):
@@ -135,10 +150,12 @@ def main() -> None:
             for done, found in enumerate(pool.imap_unordered(batch, tasks), start=1):
                 for fen in found:
                     keep(fen)
-                print(f"  worker {done}/{workers}, {len(kept):,} unique", file=sys.stderr)
+                # Flushed per worker, so whatever has finished survives an interruption.
+                sink.flush()
+                print(f"  worker {done}/{workers}, {written:,} unique", file=sys.stderr)
 
-    arguments.out.write_text("\n".join(kept) + "\n", encoding="utf-8")
-    print(f"{len(kept):,} unique positions written to {arguments.out}")
+    sink.close()
+    print(f"{written:,} unique positions in {arguments.out}")
 
 
 if __name__ == "__main__":

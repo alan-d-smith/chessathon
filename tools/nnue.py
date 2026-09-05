@@ -56,11 +56,14 @@ def indices(board: chess.Board) -> list[int]:
     return found
 
 
-def load(path: Path, limit: int | None) -> tuple[list[list[int]], list[float]]:
+def load(path: Path, limit: int | None, skip: int = 0) -> tuple[list[list[int]], list[float]]:
     """Positions as feature indices, and the label in centipawns from the side to move."""
     rows: list[list[int]] = []
     targets: list[float] = []
     with path.open(encoding="utf-8") as handle:
+        for _ in range(skip):
+            if handle.readline() == "":
+                break
         for line in handle:
             try:
                 record = json.loads(line)
@@ -82,23 +85,103 @@ def load(path: Path, limit: int | None) -> tuple[list[list[int]], list[float]]:
     return rows, targets
 
 
-def densify(rows: list[list[int]]) -> torch.Tensor:
-    matrix = torch.zeros((len(rows), INPUTS), dtype=torch.float32)
+# A position has at most 32 pieces, so every row of features fits in 32 slots padded with an
+# index whose embedding is pinned to zero. Storing it this way is 83MB rather than 2GB, and the
+# first layer sums 32 rows instead of multiplying through 768 mostly-zero columns.
+MAX_PIECES = 32
+PAD = INPUTS
+
+
+def cached(source: Path, limit: int | None) -> tuple[list[list[int]], list[float]]:
+    """Extract features, reusing anything already extracted from an earlier run.
+
+    The labelled pool only ever grows, so the features of the first N positions never change.
+    The improvement loop retrains every round, and without this it would re-parse every FEN it
+    has ever seen, every round, for an answer it already had.
+    """
+    store = source.with_suffix(".features.npz")
+    rows: list[list[int]] = []
+    targets: list[float] = []
+    done = 0
+    if store.is_file():
+        try:
+            with np.load(store) as data:
+                packed, lengths, scores = data["packed"], data["lengths"], data["targets"]
+            rows = [packed[i, : lengths[i]].tolist() for i in range(len(lengths))]
+            targets = scores.tolist()
+            done = int(data_lines_consumed(store))
+            print(f"  reused features for {len(rows):,} positions")
+        except (OSError, KeyError, ValueError):
+            rows, targets, done = [], [], 0
+
+    fresh_rows, fresh_targets = load(source, limit, skip=done)
+    rows.extend(fresh_rows)
+    targets.extend(fresh_targets)
+    if fresh_rows:
+        print(f"  extracted features for {len(fresh_rows):,} new positions")
+        widest = max((len(found) for found in rows), default=1)
+        packed = np.zeros((len(rows), widest), dtype=np.int32)
+        lengths = np.zeros(len(rows), dtype=np.int32)
+        for index, found in enumerate(rows):
+            packed[index, : len(found)] = found
+            lengths[index] = len(found)
+        np.savez(
+            store,
+            packed=packed,
+            lengths=lengths,
+            targets=np.asarray(targets, dtype=np.float32),
+            consumed=np.asarray([count_lines(source)], dtype=np.int64),
+        )
+    return rows, targets
+
+
+def count_lines(path: Path) -> int:
+    with path.open(encoding="utf-8") as handle:
+        return sum(1 for _ in handle)
+
+
+def data_lines_consumed(store: Path) -> int:
+    with np.load(store) as data:
+        return int(data["consumed"][0]) if "consumed" in data else 0
+
+
+def pack(rows: list[list[int]]) -> torch.Tensor:
+    """Feature indices as a padded (positions, 32) table."""
+    packed = torch.full((len(rows), MAX_PIECES), PAD, dtype=torch.long)
     for row, found in enumerate(rows):
-        matrix[row, torch.tensor(found, dtype=torch.long)] = 1.0
-    return matrix
+        packed[row, : len(found)] = torch.tensor(found[:MAX_PIECES], dtype=torch.long)
+    return packed
 
 
 class Network(torch.nn.Module):
-    """768 -> hidden -> 1, output in centipawns so the search can mix it with mate scores."""
+    """768 -> hidden -> 1, output in centipawns so the search can mix it with mate scores.
+
+    The first layer is an EmbeddingBag rather than a Linear because the input is one-hot: with
+    at most 32 features set, summing 32 weight rows is the same arithmetic as a 768-wide matrix
+    multiply and about twenty times less of it. The exported weights are identical either way.
+    """
 
     def __init__(self, hidden: int) -> None:
         super().__init__()
-        self.hidden = torch.nn.Linear(INPUTS, hidden)
+        self.embed = torch.nn.EmbeddingBag(INPUTS + 1, hidden, mode="sum", padding_idx=PAD)
+        self.hidden_bias = torch.nn.Parameter(torch.zeros(hidden))
         self.output = torch.nn.Linear(hidden, 1)
 
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        return self.output(torch.relu(self.hidden(features))).squeeze(1)
+    def forward(self, packed: torch.Tensor) -> torch.Tensor:
+        summed = self.embed(packed) + self.hidden_bias
+        return self.output(torch.relu(summed)).squeeze(1)
+
+
+def save(state: dict[str, torch.Tensor], path: Path) -> None:
+    """Write the net in the shape agent.py reads: 768 by hidden, then the output layer."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        path,
+        hidden_weight=state["embed.weight"][:INPUTS].numpy().astype(np.float32),
+        hidden_bias=state["hidden_bias"].numpy().astype(np.float32),
+        output_weight=state["output.weight"].numpy().reshape(-1).astype(np.float32),
+        output_bias=state["output.bias"].numpy().astype(np.float32),
+    )
 
 
 def main() -> None:
@@ -126,12 +209,12 @@ def main() -> None:
     )
     arguments = parser.parse_args()
 
-    rows, targets = load(arguments.data, arguments.limit)
+    rows, targets = cached(arguments.data, arguments.limit)
     print(f"{len(rows):,} positions, {arguments.hidden} hidden units")
     if len(rows) < 5_000:
         raise SystemExit("not enough positions to train anything trustworthy")
 
-    features = densify(rows)
+    features = pack(rows)
     wanted = torch.sigmoid(torch.tensor(targets, dtype=torch.float32) * SCALE)
     count = len(rows)
     order = torch.randperm(count)
@@ -143,8 +226,8 @@ def main() -> None:
         with np.load(arguments.warm) as data:
             if data["hidden_bias"].shape[0] == arguments.hidden:
                 with torch.no_grad():
-                    net.hidden.weight.copy_(torch.tensor(data["hidden_weight"].T))
-                    net.hidden.bias.copy_(torch.tensor(data["hidden_bias"]))
+                    net.embed.weight[:INPUTS].copy_(torch.tensor(data["hidden_weight"]))
+                    net.hidden_bias.copy_(torch.tensor(data["hidden_bias"]))
                     net.output.weight.copy_(torch.tensor(data["output_weight"]).reshape(1, -1))
                     net.output.bias.copy_(torch.tensor(data["output_bias"]))
                 print(f"  warm started from {arguments.warm}")
@@ -179,7 +262,9 @@ def main() -> None:
             loss = (errors * batch_weight[span]).mean()
             loss.backward()
             optimiser.step()
-            total += float(loss) * len(rows_batch)
+            # Report the plain error, not the importance-weighted one the gradient used, so
+            # the training number stays comparable with the holdout beside it.
+            total += float(errors.detach().mean()) * len(rows_batch)
 
         if arguments.priority > 0.0:
             # Re-rank on what the net now gets wrong, so the next pass chases current errors
@@ -199,19 +284,15 @@ def main() -> None:
         if held < best:
             best = held
             kept = {name: tensor.detach().clone() for name, tensor in net.state_dict().items()}
+            # Written the moment it improves: training runs long enough
+            # that an interruption should not cost a result already reached.
+            save(kept, arguments.out)
         print(
             f"  epoch {epoch + 1:3}/{arguments.epochs}  train {total / len(shuffled):.6f}  "
             f"holdout {held:.6f}{'  *' if held == best else ''}"
         )
 
-    arguments.out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        arguments.out,
-        hidden_weight=kept["hidden.weight"].numpy().T.astype(np.float32),
-        hidden_bias=kept["hidden.bias"].numpy().astype(np.float32),
-        output_weight=kept["output.weight"].numpy().reshape(-1).astype(np.float32),
-        output_bias=kept["output.bias"].numpy().astype(np.float32),
-    )
+    save(kept, arguments.out)
     size = arguments.out.stat().st_size
     print(f"best holdout {best:.6f}; wrote {arguments.out} ({size:,} bytes)")
 
