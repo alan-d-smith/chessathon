@@ -74,6 +74,16 @@ def main() -> None:
     parser.add_argument("--base-ms", type=int, default=4_000)
     parser.add_argument("--increment-ms", type=int, default=40)
     parser.add_argument("--skip-plies", type=int, default=8)
+    parser.add_argument(
+        "--fens",
+        type=Path,
+        help="also write the bare positions here, for the labeller to score",
+    )
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help="add to what is already there instead of starting again",
+    )
     # Only one side of a game thinks at a time; the other is blocked waiting for a move. A
     # concurrent game therefore costs about one core, not two, which is why half the cores
     # left the machine half idle. Four fifths keeps it busy with headroom to spare.
@@ -105,18 +115,39 @@ def main() -> None:
     arguments.out.parent.mkdir(parents=True, exist_ok=True)
 
     written = 0
+    # Game ids have to stay unique across rounds, or a holdout split by game would put two
+    # different games' positions in the same group.
+    offset = 0
+    mode = "a" if arguments.append else "w"
+    if arguments.append and arguments.out.is_file():
+        with arguments.out.open(encoding="utf-8") as existing:
+            for line in existing:
+                try:
+                    offset = max(offset, json.loads(line).get("game", 0) + 1)
+                except json.JSONDecodeError:
+                    continue
+        print(f"appending after {offset} games already recorded")
+
     print(f"{len(tasks)} games, {workers} at a time")
+    fens = arguments.fens.open(mode, encoding="utf-8") if arguments.fens else None
     with (
-        arguments.out.open("w", encoding="utf-8") as sink,
+        arguments.out.open(mode, encoding="utf-8") as sink,
         multiprocessing.Pool(workers) as pool,
     ):
         for done, rows in enumerate(pool.imap_unordered(one, tasks), start=1):
             for fen, score, game_id in rows:
-                sink.write(json.dumps(row(fen, score, game_id)) + LINE_END)
+                sink.write(json.dumps(row(fen, score, game_id + offset)) + LINE_END)
+                if fens is not None:
+                    fens.write(fen + LINE_END)
                 written += 1
+            sink.flush()
+            if fens is not None:
+                fens.flush()
             if done % 50 == 0 or done == len(tasks):
                 print(f"  {done}/{len(tasks)} games, {written:,} positions")
 
+    if fens is not None:
+        fens.close()
     print(f"{written:,} outcome-labelled positions written to {arguments.out}")
 
 

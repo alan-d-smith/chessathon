@@ -92,6 +92,48 @@ MAX_PIECES = 32
 PAD = INPUTS
 
 
+def blend_targets(
+    fens: list[str], scores: list[float], outcomes: Path, weight: float
+) -> tuple[list[float], list[int]]:
+    """Mix the engine's score with what actually happened, and say which game each came from.
+
+    This is how a network wants to be taught. The engine score is dense and precise but is only
+    an opinion, and one formed by a search far deeper than ours. The game result is the ground
+    truth and carries no opinion at all, but one bit of it per game is a thin signal. Blending
+    keeps the precision of the first and anchors it to the second.
+
+    Positions with no game attached keep the engine score alone and sit in their own group.
+    """
+    from_game: dict[str, tuple[float, int]] = {}
+    if outcomes.is_file():
+        with outcomes.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                from_game[record["fen"]] = (float(record["result"]), int(record.get("game", -1)))
+
+    blended: list[float] = []
+    groups: list[int] = []
+    matched = 0
+    loner = 10_000_000
+    for fen, score in zip(fens, scores, strict=True):
+        engine = 1.0 / (1.0 + math.exp(-score * SCALE))
+        found = from_game.get(fen)
+        if found is None:
+            blended.append(engine)
+            groups.append(loner)
+            loner += 1
+            continue
+        result, game = found
+        blended.append(weight * engine + (1.0 - weight) * result)
+        groups.append(game)
+        matched += 1
+    print(f"  {matched:,} positions carry a game result as well as an engine score")
+    return blended, groups
+
+
 def cached(source: Path, limit: int | None) -> tuple[list[list[int]], list[float]]:
     """Extract features, reusing anything already extracted from an earlier run.
 
@@ -145,6 +187,23 @@ def data_lines_consumed(store: Path) -> int:
         return int(data["consumed"][0]) if "consumed" in data else 0
 
 
+def read_fens(path: Path, limit: int | None) -> list[tuple[str, float]]:
+    """The positions in the same order load() returns them, so targets line up by index."""
+    found: list[tuple[str, float]] = []
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("mate") is None and record.get("cp") is None:
+                continue
+            found.append((record["fen"], 0.0))
+            if limit and len(found) >= limit:
+                break
+    return found
+
+
 def pack(rows: list[list[int]]) -> torch.Tensor:
     """Feature indices as a padded (positions, 32) table."""
     packed = torch.full((len(rows), MAX_PIECES), PAD, dtype=torch.long)
@@ -196,6 +255,17 @@ def main() -> None:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--warm", type=Path, help="start from an existing net instead of noise")
     parser.add_argument(
+        "--outcomes",
+        type=Path,
+        help="game results to blend into the target, from tools/selfplay.py",
+    )
+    parser.add_argument(
+        "--outcome-weight",
+        type=float,
+        default=0.7,
+        help="how much of the target is the engine score; the rest is the game result",
+    )
+    parser.add_argument(
         "--priority",
         type=float,
         default=0.0,
@@ -215,11 +285,27 @@ def main() -> None:
         raise SystemExit("not enough positions to train anything trustworthy")
 
     features = pack(rows)
-    wanted = torch.sigmoid(torch.tensor(targets, dtype=torch.float32) * SCALE)
     count = len(rows)
-    order = torch.randperm(count)
-    split = int(count * (1.0 - arguments.holdout))
-    train, test = order[:split], order[split:]
+    groups: list[int] = []
+    if arguments.outcomes and arguments.outcomes.is_file():
+        fens = [fen for fen, _ in read_fens(arguments.data, arguments.limit)]
+        mixed, groups = blend_targets(fens, targets, arguments.outcomes, arguments.outcome_weight)
+        wanted = torch.tensor(mixed, dtype=torch.float32)
+    else:
+        wanted = torch.sigmoid(torch.tensor(targets, dtype=torch.float32) * SCALE)
+
+    if groups:
+        # Split by game: positions from one game share a result, so splitting by position puts
+        # near-copies of the same answer on both sides and the holdout flatters the fit.
+        unique = sorted(set(groups))
+        shuffled = [unique[i] for i in torch.randperm(len(unique)).tolist()]
+        held = set(shuffled[: max(1, int(len(unique) * arguments.holdout))])
+        train = torch.tensor([i for i, g in enumerate(groups) if g not in held], dtype=torch.long)
+        test = torch.tensor([i for i, g in enumerate(groups) if g in held], dtype=torch.long)
+    else:
+        order = torch.randperm(count)
+        split = int(count * (1.0 - arguments.holdout))
+        train, test = order[:split], order[split:]
 
     net = Network(arguments.hidden)
     if arguments.warm and arguments.warm.is_file():

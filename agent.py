@@ -537,6 +537,17 @@ def quiesce(board: chess.Board, alpha: int, beta: int) -> int:
             gain = VALUE[victim] if victim is not None else VALUE[chess.PAWN]
             if standing + gain + DELTA_MARGIN < alpha:
                 continue
+            # Taking a defended piece with a more valuable one loses material unless something
+            # deeper justifies it, and quiescence is where most of the nodes are. Skipping
+            # these shrinks the tree rather than making each node faster, which is the only
+            # kind of gain left: even a free move generator would only be worth 1.3x nodes.
+            attacker = board.piece_type_at(move.from_square)
+            if (
+                attacker is not None
+                and VALUE[attacker] > gain
+                and board.is_attacked_by(not board.turn, move.to_square)
+            ):
+                continue
         board.push(move)
         score = -quiesce(board, -beta, -alpha)
         board.pop()

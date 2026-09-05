@@ -1,11 +1,19 @@
-"""Improve the agent unattended: generate, label, retrain, play, promote, repeat.
+"""Improve the agent unattended: play, label, retrain, test, promote, repeat.
 
-One round is the whole cycle. Positions come from randomised Stockfish playouts, get labelled,
-join everything gathered so far, and the network is retrained from the current champion's
-weights rather than from noise. The candidate then has to beat the champion over real games
-before it replaces it, judged by the same SPRT that judges everything else here.
+One round is the whole cycle. The champion plays a few thousand games against itself; every
+position in them is kept and tagged with how that game finished; Stockfish scores the same
+positions; and the network is retrained on both signals at once, warm started from the
+champion's own weights. The candidate then has to beat the champion over real games before it
+replaces it, judged by the same SPRT that judges everything else here.
 
-    uv run python -m tools.loop --rounds 20 --games 4000
+    uv run python -m tools.loop --rounds 1000 --games 3000
+
+Two signals rather than one, because each is weak where the other is strong. A Stockfish score
+is dense and precise but is an opinion formed by a search far deeper than ours, and fitting it
+teaches the network to agree with Stockfish rather than to win. A game result is ground truth
+with no opinion in it at all, but it is one number per game, so on its own it needs tens of
+thousands of games before it says anything. Trained on 800 games alone it produced weights that
+scored bishop pair at minus seventy and lost by 359 Elo.
 
 Nothing is promoted on a training loss. A network that fits the labels better and loses the
 match is worse, and that has already happened twice: a fit that improved its holdout by 17%
@@ -25,6 +33,7 @@ from pathlib import Path
 CHAMPION = Path("baselines/champion")
 CANDIDATE = Path("data/candidate")
 POOL = Path("data/loop_positions.txt")
+OUTCOMES = Path("data/loop_outcomes.jsonl")
 LABELS = Path("data/loop_labelled.jsonl")
 NET = Path("data/nets/loop_net.npz")
 LOG = Path("data/loop_log.txt")
@@ -76,12 +85,19 @@ def build_candidate(source: Path, net: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the improvement loop until stopped.")
     parser.add_argument("--rounds", type=int, default=100)
-    parser.add_argument("--games", type=int, default=4000, help="playout games a round")
+    parser.add_argument("--games", type=int, default=3000, help="self-play games a round")
     parser.add_argument("--nodes", type=int, default=50_000, help="labelling depth")
     parser.add_argument("--hidden", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--priority", type=float, default=0.6)
     parser.add_argument("--workers", type=int, default=48)
+    parser.add_argument("--openings", type=Path, default=Path("data/bigopenings.txt"))
+    parser.add_argument(
+        "--outcome-weight",
+        type=float,
+        default=0.7,
+        help="share of the training target taken from the engine score rather than the result",
+    )
     arguments = parser.parse_args()
 
     LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -91,21 +107,30 @@ def main() -> None:
 
     for round_number in range(1, arguments.rounds + 1):
         started = time.monotonic()
-        note(f"round {round_number}: generating positions")
+        # The champion plays its own games and every position in them is kept, tagged with how
+        # that game finished. This is the part that makes it self-play rather than distillation:
+        # the training signal comes from what actually won, not only from what Stockfish thinks.
+        note(f"round {round_number}: the champion plays {arguments.games} games")
         code, _ = run(
             [
-                "tools.gen_positions",
+                "tools.selfplay",
+                "--white", str(CHAMPION),
+                "--black", str(CHAMPION),
                 "--games", str(arguments.games),
                 "--workers", str(arguments.workers),
-                "--out", str(POOL),
-                "--playout-nodes", "6000",
-                "--every", "4",
-                "--seed", str(round_number * 7919),
+                "--openings", str(arguments.openings),
+                "--out", str(OUTCOMES),
+                "--fens", str(POOL),
+                "--append",
+                "--base-ms", "3000",
+                "--increment-ms", "30",
             ]
         )
         if code != 0 or not POOL.is_file():
-            note(f"round {round_number}: generation failed, skipping round")
+            note(f"round {round_number}: self-play failed, skipping round")
             continue
+        played = sum(1 for _ in OUTCOMES.open(encoding="utf-8"))
+        note(f"round {round_number}: {played:,} positions from games played so far")
 
         note(f"round {round_number}: labelling")
         # Appends and skips what it already has, so the pool grows across rounds.
@@ -135,6 +160,9 @@ def main() -> None:
                 "--epochs", str(arguments.epochs),
                 "--rate", "3e-3",
                 "--priority", str(arguments.priority),
+                # Both signals: the engine score for precision, the game result for truth.
+                "--outcomes", str(OUTCOMES),
+                "--outcome-weight", str(arguments.outcome_weight),
                 *(["--warm", str(NET)] if NET.is_file() else []),
             ],
             quiet=True,
