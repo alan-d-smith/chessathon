@@ -769,6 +769,11 @@ def get_move(fen: str, time_left_ms: int) -> str:
         increment_ms = min(max(measured, 0.0), INCREMENT_CEILING_MS)
 
     started = time.monotonic()
+    # Positions we have already stood in, and the ones our own moves have already produced.
+    # The search tests the position after a candidate move, so it is the second set that makes
+    # the test able to match at all: a key carries the side to move, so a position with us to
+    # move can never equal one with them to move. Without the move played below, this check
+    # was dead code that had never once fired.
     seen.add(board._transposition_key())
     deadline = started + budget_s(time_left_ms)
     nodes = 0
@@ -787,8 +792,9 @@ def get_move(fen: str, time_left_ms: int) -> str:
             for move in candidates(board, choice, 0):
                 board.push(move)
                 score = -negamax(board, depth - 1, -INFINITY, -alpha, 1)
-                # Shuffling back into a position we have already been asked about hands over a
-                # draw the referee claims for us, so it is only worth it when we are worse.
+                # Returning to a position our own play has already produced walks towards the
+                # threefold the referee claims automatically, so it is only worth it when we
+                # are worse. A won game can otherwise be drawn without ever being told.
                 repeated = board._transposition_key() in seen
                 board.pop()
                 if repeated and score > 0:
@@ -799,7 +805,10 @@ def get_move(fen: str, time_left_ms: int) -> str:
                 alpha = max(alpha, score)
             finished = True
         except Timeout:
-            pass
+            # The search unwinds through every frame without popping, so the board is left
+            # part way down whatever line it was in. Nothing below used it until the repeat
+            # check needed it, and a stale board there is an illegal push, not a wrong score.
+            board = chess.Board(fen)
 
         # A finished depth is trustworthy. An abandoned one is only worth taking if it had
         # already improved on the move the previous depth settled on.
@@ -810,6 +819,11 @@ def get_move(fen: str, time_left_ms: int) -> str:
         reached = depth
         if abs(best_score) > MATE - MAX_DEPTH:
             break  # a mate score will not get better with depth
+
+    # Remember where this move leaves the board, so a later move returning here is recognised.
+    board.push(choice)
+    seen.add(board._transposition_key())
+    board.pop()
 
     last_clock_ms = float(time_left_ms)
     last_spent_ms = (time.monotonic() - started) * 1000.0
