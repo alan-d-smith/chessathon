@@ -356,13 +356,22 @@ def main() -> None:
     net = Network(arguments.hidden).to(device)
     if arguments.warm and arguments.warm.is_file():
         with np.load(arguments.warm) as data:
-            if data["hidden_bias"].shape[0] == arguments.hidden:
+            stored = int(data["hidden_bias"].shape[0])
+            if stored == arguments.hidden:
                 with torch.no_grad():
                     net.embed.weight[:INPUTS].copy_(torch.tensor(data["hidden_weight"]))
                     net.hidden_bias.copy_(torch.tensor(data["hidden_bias"]))
                     net.output.weight.copy_(torch.tensor(data["output_weight"]).reshape(1, -1))
                     net.output.bias.copy_(torch.tensor(data["output_bias"]))
                 print(f"  warm started from {arguments.warm}")
+            else:
+                # Weights cannot be loaded into a different shape, so a mismatch means training
+                # from noise while looking exactly like a normal round. That happened once and
+                # produced a net of the wrong width that then won and became the champion.
+                print(
+                    f"  WARNING: {arguments.warm} holds {stored} units but training at "
+                    f"{arguments.hidden}. Starting from scratch, not from the best net."
+                )
     optimiser = torch.optim.Adam(net.parameters(), lr=arguments.rate)
 
     best = float("inf")
