@@ -283,7 +283,7 @@ def pawn_counts(white_pawns: int, black_pawns: int) -> tuple[int, ...]:
     return counts
 
 
-def evaluate(board: chess.Board) -> int:
+def evaluate_tables(board: chess.Board) -> int:
     """Material and placement, from the side to move. Positive means the mover is better."""
     white = board.occupied_co[chess.WHITE]
     black = board.occupied_co[chess.BLACK]
@@ -347,6 +347,10 @@ def evaluate(board: chess.Board) -> int:
     return score if board.turn == chess.WHITE else -score
 
 
+# What the search calls. Rebound below if a network ships, either to replace this or to
+# correct it; the search itself never needs to know which.
+evaluate = evaluate_tables
+
 # An optional network, used only when weights/net.npz ships alongside this file. numpy and
 # numba are imported inside the loader rather than at the top, so an agent without a network
 # pays nothing for the possibility of one: no import cost, no compile, no new way to fail.
@@ -369,6 +373,7 @@ def load_net() -> bool:
 
     try:
         with np.load(path) as data:
+            residual = bool(data["residual"][0]) if "residual" in data else False
             hidden_w = np.ascontiguousarray(data["hidden_weight"], dtype=np.float32)
             hidden_b = np.ascontiguousarray(data["hidden_bias"], dtype=np.float32)
             out_w = np.ascontiguousarray(data["output_weight"], dtype=np.float32)
@@ -435,6 +440,10 @@ def load_net() -> bool:
     global net_forward
     net_forward = forward
     net_state.update(
+        # A residual net scores the difference from the tables rather than the position, so the
+        # two must be added. The flag ships with the weights: reading it from the file means a
+        # net cannot be loaded in the wrong mode by mistake.
+        residual=residual,
         numpy=np,
         hidden_w=hidden_w,
         hidden_b=hidden_b,
@@ -474,6 +483,17 @@ def evaluate_net(board: chess.Board) -> int:
     )
 
 
+def evaluate_residual(board: chess.Board) -> int:
+    """The tuned tables, corrected by the network.
+
+    Learning the whole evaluation from raw piece placement means rediscovering passed pawns,
+    king safety and phase tapering, all of which the tables are simply handed. Learning only
+    what the tables get wrong starts level with them instead of a hundred Elo behind, and the
+    network can only add to what already works.
+    """
+    return evaluate_tables(board) + evaluate_net(board)
+
+
 USING_NET: Final = load_net()
 
 if USING_NET:
@@ -481,7 +501,7 @@ if USING_NET:
     # part of. Spending it here puts it inside the 90 second import budget rather than on the
     # clock, warmed with the argument types the real calls will use.
     evaluate_net(chess.Board())
-    evaluate = evaluate_net
+    evaluate = evaluate_residual if net_state.get("residual") else evaluate_net
 
 
 def capture_value(board: chess.Board, move: chess.Move) -> int:
@@ -536,6 +556,17 @@ def quiesce(board: chess.Board, alpha: int, beta: int) -> int:
             victim = board.piece_type_at(move.to_square)
             gain = VALUE[victim] if victim is not None else VALUE[chess.PAWN]
             if standing + gain + DELTA_MARGIN < alpha:
+                continue
+            # Taking a defended piece with a more valuable one loses material unless something
+            # deeper justifies it, and quiescence is where most of the nodes are. Skipping
+            # these shrinks the tree rather than making each node faster, which is the only
+            # kind of gain left: even a free move generator would only be worth 1.3x nodes.
+            attacker = board.piece_type_at(move.from_square)
+            if (
+                attacker is not None
+                and VALUE[attacker] > gain
+                and board.is_attacked_by(not board.turn, move.to_square)
+            ):
                 continue
         board.push(move)
         score = -quiesce(board, -beta, -alpha)
