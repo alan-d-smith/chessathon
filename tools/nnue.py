@@ -231,11 +231,17 @@ class Network(torch.nn.Module):
         return self.output(torch.relu(summed)).squeeze(1)
 
 
-def save(state: dict[str, torch.Tensor], path: Path) -> None:
-    """Write the net in the shape agent.py reads: 768 by hidden, then the output layer."""
+def save(state: dict[str, torch.Tensor], path: Path, residual: bool = False) -> None:
+    """Write the net in the shape agent.py reads: 768 by hidden, then the output layer.
+
+    The residual flag travels with the weights. A net trained to correct the tables scores
+    something entirely different from one trained to replace them, and loading either in the
+    wrong mode would produce a plausible-looking evaluation that is quietly nonsense.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
         path,
+        residual=np.asarray([1 if residual else 0], dtype=np.int8),
         hidden_weight=state["embed.weight"][:INPUTS].numpy().astype(np.float32),
         hidden_bias=state["hidden_bias"].numpy().astype(np.float32),
         output_weight=state["output.weight"].numpy().reshape(-1).astype(np.float32),
@@ -254,6 +260,11 @@ def main() -> None:
     parser.add_argument("--holdout", type=float, default=0.1)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--warm", type=Path, help="start from an existing net instead of noise")
+    parser.add_argument(
+        "--residual",
+        action="store_true",
+        help="learn what the tuned tables get wrong, rather than the whole evaluation",
+    )
     parser.add_argument(
         "--outcomes",
         type=Path,
@@ -292,6 +303,19 @@ def main() -> None:
 
     features = pack(rows).to(device)
     count = len(rows)
+
+    if arguments.residual:
+        # Subtract what the tables already score, so the network is only asked for the part
+        # they get wrong. It then starts level with them rather than having to catch up.
+        import agent
+
+        scored = read_fens(arguments.data, arguments.limit)
+        base = [agent.evaluate_tables(chess.Board(fen)) for fen, _ in scored]
+        targets = [
+            target - float(tables) for target, tables in zip(targets, base, strict=True)
+        ]
+        spread = sum(abs(t) for t in targets) / max(len(targets), 1)
+        print(f"  residual targets: {spread:.0f}cp away from the tables on average")
     groups: list[int] = []
     if arguments.outcomes and arguments.outcomes.is_file():
         fens = [fen for fen, _ in read_fens(arguments.data, arguments.limit)]
@@ -385,13 +409,13 @@ def main() -> None:
             }
             # Written the moment it improves: training runs long enough
             # that an interruption should not cost a result already reached.
-            save(kept, arguments.out)
+            save(kept, arguments.out, arguments.residual)
         print(
             f"  epoch {epoch + 1:3}/{arguments.epochs}  train {total / len(shuffled):.6f}  "
             f"holdout {held:.6f}{'  *' if held == best else ''}"
         )
 
-    save(kept, arguments.out)
+    save(kept, arguments.out, arguments.residual)
     size = arguments.out.stat().st_size
     print(f"best holdout {best:.6f}; wrote {arguments.out} ({size:,} bytes)")
 
