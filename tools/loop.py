@@ -1,5 +1,11 @@
 """Improve the agent unattended: play, label, retrain, test, promote, repeat.
 
+Run it with --residual. Asking the network for the whole evaluation means asking it to
+rediscover passed pawns, king safety and phase tapering from raw piece placement, all of which
+the tuned tables are simply handed; ten times the data narrowed that gap from 184 Elo to 76 and
+then stopped. Asking it only for what the tables get wrong starts level with them instead, and
+measured 67 Elo better on the first attempt.
+
 One round is the whole cycle. The champion plays a few thousand games against itself; every
 position in them is kept and tagged with how that game finished; Stockfish scores the same
 positions; and the network is retrained on both signals at once, warm started from the
@@ -165,6 +171,11 @@ def main() -> None:
         help="interpreter for the training stage, e.g. a venv with CUDA torch",
     )
     parser.add_argument(
+        "--residual",
+        action="store_true",
+        help="train the network to correct the tuned tables rather than replace them",
+    )
+    parser.add_argument(
         "--outcome-weight",
         type=float,
         default=0.7,
@@ -249,6 +260,7 @@ def main() -> None:
                 # Both signals: the engine score for precision, the game result for truth.
                 "--outcomes", str(OUTCOMES),
                 "--outcome-weight", str(arguments.outcome_weight),
+                *(["--residual"] if arguments.residual else []),
                 *(["--warm", str(BEST)] if BEST.is_file() else []),
             ],
             quiet=True,

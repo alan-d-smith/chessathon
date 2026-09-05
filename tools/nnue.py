@@ -184,6 +184,13 @@ def cached(
     targets.extend(fresh_targets)
     tables.extend(fresh_tables)
     fens.extend(fresh_fens)
+    if fresh_rows and limit:
+        # A limited run is for debugging. Writing its partial result to the cache while
+        # recording the whole file as consumed poisons every later run, which is exactly what
+        # happened: a --limit 80000 smoke test left the next full run training on 80k rows.
+        print(f"  {len(rows):,} positions (limited run, cache left alone)")
+        return rows, targets, tables, fens
+
     if fresh_rows:
         print(f"  extracted features for {len(fresh_rows):,} new positions")
         widest = max((len(found) for found in rows), default=1)
