@@ -125,6 +125,46 @@ an engine that ignores it never replies, which shows up as the opponent losing e
 time. That is why the fault line names which side broke: a 100% score against a strong engine is
 far more likely to be a broken harness than a breakthrough, and it was.
 
+## The improvement loop
+
+`tools/loop.py` runs the whole cycle unattended, for as long as you leave it going:
+
+```
+uv run python -m tools.loop --rounds 1000 --games 2000 \
+    --train-python .venv-train/Scripts/python.exe
+```
+
+Each round the champion plays a couple of thousand games against itself; every position in them
+is kept and tagged with how that game finished; Stockfish scores the same positions; the network
+retrains on both signals at once, warm started from the champion's own weights; and the
+candidate then has to beat the champion over real games before it replaces it.
+
+Two signals rather than one, because each is weak where the other is strong. A Stockfish score
+is dense and precise but is an opinion formed by a search far deeper than ours, so fitting it
+alone teaches the network to agree with Stockfish rather than to win. A game result is ground
+truth with no opinion in it, but it is one number per game. Trained on 800 games of results
+alone the fit scored the bishop pair at minus seventy and lost by 359 Elo.
+
+Nothing is promoted on a training loss, ever. The match is the only thing with a vote, and a
+rejected round is the system working. Only `baselines/champion` is written to, so an unattended
+loop cannot put a regression into `agent.py`; shipping stays a deliberate act.
+
+Every stage runs under a deadline and is killed with its whole process tree if it overruns,
+because a pool driving hundreds of agent subprocesses can deadlock and a loop without a deadline
+simply stops for the night with everything idle. Every stage also writes as it goes and resumes
+from what is on disk, so a crash costs the current stage rather than the run.
+
+Training uses a GPU when one is present, through a second environment holding CUDA torch:
+
+```
+uv venv .venv-train --python 3.12
+uv pip install --python .venv-train torch --index-url https://download.pytorch.org/whl/cu121
+uv pip install --python .venv-train chess numpy
+```
+
+The main environment stays CPU-only on purpose, because it has to match the competition
+platform. Only the fitting is free to use hardware the agent never will.
+
 ## Fitting the evaluation
 
 The evaluation is a dot product: every term is a count of something on the board times a
