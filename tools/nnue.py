@@ -56,10 +56,21 @@ def indices(board: chess.Board) -> list[int]:
     return found
 
 
-def load(path: Path, limit: int | None, skip: int = 0) -> tuple[list[list[int]], list[float]]:
-    """Positions as feature indices, and the label in centipawns from the side to move."""
+def load(
+    path: Path, limit: int | None, skip: int = 0
+) -> tuple[list[list[int]], list[float], list[float], list[str]]:
+    """Feature indices, the label in centipawns, and what the tuned tables score.
+
+    All three come from one pass. Deriving any of them from a second pass over the file means
+    two filters that have to agree forever, and they stopped agreeing the moment the feature
+    cache let the first pass skip work the second still did.
+    """
+    import agent
+
     rows: list[list[int]] = []
     targets: list[float] = []
+    tables: list[float] = []
+    fens: list[str] = []
     with path.open(encoding="utf-8") as handle:
         for _ in range(skip):
             if handle.readline() == "":
@@ -80,9 +91,11 @@ def load(path: Path, limit: int | None, skip: int = 0) -> tuple[list[list[int]],
             # Labels are already relative to the side to move, and so are the features.
             rows.append(indices(board))
             targets.append(float(score))
+            tables.append(float(agent.evaluate_tables(board)))
+            fens.append(record["fen"])
             if limit and len(rows) >= limit:
                 break
-    return rows, targets
+    return rows, targets, tables, fens
 
 
 # A position has at most 32 pieces, so every row of features fits in 32 slots padded with an
@@ -134,7 +147,9 @@ def blend_targets(
     return blended, groups
 
 
-def cached(source: Path, limit: int | None) -> tuple[list[list[int]], list[float]]:
+def cached(
+    source: Path, limit: int | None
+) -> tuple[list[list[int]], list[float], list[float], list[str]]:
     """Extract features, reusing anything already extracted from an earlier run.
 
     The labelled pool only ever grows, so the features of the first N positions never change.
@@ -142,23 +157,33 @@ def cached(source: Path, limit: int | None) -> tuple[list[list[int]], list[float
     has ever seen, every round, for an answer it already had.
     """
     store = source.with_suffix(".features.npz")
+    names = source.with_suffix(".fens.txt")
     rows: list[list[int]] = []
     targets: list[float] = []
+    tables: list[float] = []
+    fens: list[str] = []
     done = 0
     if store.is_file():
         try:
             with np.load(store) as data:
-                packed, lengths, scores = data["packed"], data["lengths"], data["targets"]
+                packed, lengths = data["packed"], data["lengths"]
+                scores, scored = data["targets"], data["tables"]
             rows = [packed[i, : lengths[i]].tolist() for i in range(len(lengths))]
             targets = scores.tolist()
+            tables = scored.tolist()
+            fens = names.read_text(encoding="utf-8").splitlines() if names.is_file() else []
+            if len(fens) != len(rows):
+                raise ValueError("cached positions and their names disagree")
             done = int(data_lines_consumed(store))
             print(f"  reused features for {len(rows):,} positions")
         except (OSError, KeyError, ValueError):
-            rows, targets, done = [], [], 0
+            rows, targets, tables, fens, done = [], [], [], [], 0
 
-    fresh_rows, fresh_targets = load(source, limit, skip=done)
+    fresh_rows, fresh_targets, fresh_tables, fresh_fens = load(source, limit, skip=done)
     rows.extend(fresh_rows)
     targets.extend(fresh_targets)
+    tables.extend(fresh_tables)
+    fens.extend(fresh_fens)
     if fresh_rows:
         print(f"  extracted features for {len(fresh_rows):,} new positions")
         widest = max((len(found) for found in rows), default=1)
@@ -172,9 +197,11 @@ def cached(source: Path, limit: int | None) -> tuple[list[list[int]], list[float
             packed=packed,
             lengths=lengths,
             targets=np.asarray(targets, dtype=np.float32),
+            tables=np.asarray(tables, dtype=np.float32),
             consumed=np.asarray([count_lines(source)], dtype=np.int64),
         )
-    return rows, targets
+        names.write_text(chr(10).join(fens) + chr(10), encoding="utf-8")
+    return rows, targets, tables, fens
 
 
 def count_lines(path: Path) -> int:
@@ -185,23 +212,6 @@ def count_lines(path: Path) -> int:
 def data_lines_consumed(store: Path) -> int:
     with np.load(store) as data:
         return int(data["consumed"][0]) if "consumed" in data else 0
-
-
-def read_fens(path: Path, limit: int | None) -> list[tuple[str, float]]:
-    """The positions in the same order load() returns them, so targets line up by index."""
-    found: list[tuple[str, float]] = []
-    with path.open(encoding="utf-8") as handle:
-        for line in handle:
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if record.get("mate") is None and record.get("cp") is None:
-                continue
-            found.append((record["fen"], 0.0))
-            if limit and len(found) >= limit:
-                break
-    return found
 
 
 def pack(rows: list[list[int]]) -> torch.Tensor:
@@ -296,7 +306,7 @@ def main() -> None:
     if device.type == "cuda":
         print(f"  training on {torch.cuda.get_device_name(0)}")
 
-    rows, targets = cached(arguments.data, arguments.limit)
+    rows, targets, tables, fens = cached(arguments.data, arguments.limit)
     print(f"{len(rows):,} positions, {arguments.hidden} hidden units")
     if len(rows) < 5_000:
         raise SystemExit("not enough positions to train anything trustworthy")
@@ -307,18 +317,13 @@ def main() -> None:
     if arguments.residual:
         # Subtract what the tables already score, so the network is only asked for the part
         # they get wrong. It then starts level with them rather than having to catch up.
-        import agent
-
-        scored = read_fens(arguments.data, arguments.limit)
-        base = [agent.evaluate_tables(chess.Board(fen)) for fen, _ in scored]
         targets = [
-            target - float(tables) for target, tables in zip(targets, base, strict=True)
+            target - scored for target, scored in zip(targets, tables, strict=True)
         ]
-        spread = sum(abs(t) for t in targets) / max(len(targets), 1)
+        spread = sum(abs(target) for target in targets) / max(len(targets), 1)
         print(f"  residual targets: {spread:.0f}cp away from the tables on average")
     groups: list[int] = []
     if arguments.outcomes and arguments.outcomes.is_file():
-        fens = [fen for fen, _ in read_fens(arguments.data, arguments.limit)]
         mixed, groups = blend_targets(fens, targets, arguments.outcomes, arguments.outcome_weight)
         wanted = torch.tensor(mixed, dtype=torch.float32).to(device)
     else:
