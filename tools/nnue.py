@@ -111,6 +111,19 @@ def main() -> None:
     parser.add_argument("--rate", type=float, default=1e-3)
     parser.add_argument("--holdout", type=float, default=0.1)
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--warm", type=Path, help="start from an existing net instead of noise")
+    parser.add_argument(
+        "--priority",
+        type=float,
+        default=0.0,
+        help="prioritised sampling exponent; 0 is uniform, 0.6 is a typical value",
+    )
+    parser.add_argument(
+        "--correction",
+        type=float,
+        default=0.4,
+        help="importance-sampling exponent that undoes the bias prioritising introduces",
+    )
     arguments = parser.parse_args()
 
     rows, targets = load(arguments.data, arguments.limit)
@@ -126,22 +139,56 @@ def main() -> None:
     train, test = order[:split], order[split:]
 
     net = Network(arguments.hidden)
+    if arguments.warm and arguments.warm.is_file():
+        with np.load(arguments.warm) as data:
+            if data["hidden_bias"].shape[0] == arguments.hidden:
+                with torch.no_grad():
+                    net.hidden.weight.copy_(torch.tensor(data["hidden_weight"].T))
+                    net.hidden.bias.copy_(torch.tensor(data["hidden_bias"]))
+                    net.output.weight.copy_(torch.tensor(data["output_weight"]).reshape(1, -1))
+                    net.output.bias.copy_(torch.tensor(data["output_bias"]))
+                print(f"  warm started from {arguments.warm}")
     optimiser = torch.optim.Adam(net.parameters(), lr=arguments.rate)
 
     best = float("inf")
     kept = {name: tensor.detach().clone() for name, tensor in net.state_dict().items()}
+    # Uniform to begin with; prioritised sampling replaces this once there are errors to rank by.
+    priority = torch.ones(len(train), dtype=torch.float64)
     for epoch in range(arguments.epochs):
         net.train()
-        shuffled = train[torch.randperm(len(train))]
+        if arguments.priority > 0.0 and epoch > 0:
+            chance = priority / priority.sum()
+            picked = torch.multinomial(chance, len(train), replacement=True)
+            shuffled = train[picked]
+            # Sampling hard positions more often skews the gradient towards them, and the
+            # hardest positions are often the ones the labeller got wrong. The importance
+            # weight is what buys the focus without inheriting the bias that comes with it.
+            weight = (1.0 / (len(train) * chance[picked])) ** arguments.correction
+            batch_weight = (weight / weight.max()).float()
+        else:
+            shuffled = train[torch.randperm(len(train))]
+            batch_weight = torch.ones(len(train), dtype=torch.float32)
+
         total = 0.0
         for start in range(0, len(shuffled), arguments.batch):
-            rows_batch = shuffled[start : start + arguments.batch]
+            span = slice(start, start + arguments.batch)
+            rows_batch = shuffled[span]
             optimiser.zero_grad()
             predicted = torch.sigmoid(net(features[rows_batch]) * SCALE)
-            loss = torch.nn.functional.mse_loss(predicted, wanted[rows_batch])
+            errors = (predicted - wanted[rows_batch]) ** 2
+            loss = (errors * batch_weight[span]).mean()
             loss.backward()
             optimiser.step()
             total += float(loss) * len(rows_batch)
+
+        if arguments.priority > 0.0:
+            # Re-rank on what the net now gets wrong, so the next pass chases current errors
+            # rather than the ones it has already learned away.
+            with torch.no_grad():
+                gap = (
+                    torch.sigmoid(net(features[train]) * SCALE) - wanted[train]
+                ).abs().double()
+            priority = (gap + 1e-4) ** arguments.priority
         net.eval()
         with torch.no_grad():
             held = float(
