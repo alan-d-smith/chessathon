@@ -39,10 +39,15 @@ NET = Path("data/nets/loop_net.npz")
 LOG = Path("data/loop_log.txt")
 
 
-def run(command: list[str], quiet: bool = False) -> tuple[int, str]:
-    """Run one stage. A stage that fails should not take the loop down with it."""
+def run(command: list[str], quiet: bool = False, python: str = "") -> tuple[int, str]:
+    """Run one stage. A stage that fails should not take the loop down with it.
+
+    `python` lets the training stage run under a different interpreter. The agent must match
+    the competition environment exactly, which is CPU-only torch; fitting the network has no
+    such constraint and is much faster on a GPU, so it gets its own interpreter when one exists.
+    """
     finished = subprocess.run(
-        [sys.executable, "-m", *command],
+        [python or sys.executable, "-m", *command],
         capture_output=True,
         text=True,
         check=False,
@@ -92,6 +97,12 @@ def main() -> None:
     parser.add_argument("--priority", type=float, default=0.6)
     parser.add_argument("--workers", type=int, default=48)
     parser.add_argument("--openings", type=Path, default=Path("data/bigopenings.txt"))
+    parser.add_argument(
+        "--train-python",
+        type=str,
+        default="",
+        help="interpreter for the training stage, e.g. a venv with CUDA torch",
+    )
     parser.add_argument(
         "--outcome-weight",
         type=float,
@@ -166,6 +177,7 @@ def main() -> None:
                 *(["--warm", str(NET)] if NET.is_file() else []),
             ],
             quiet=True,
+            python=arguments.train_python,
         )
         if code != 0 or not NET.is_file():
             note(f"round {round_number}: training failed, skipping round")

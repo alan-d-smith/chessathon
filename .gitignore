@@ -1,4 +1,7 @@
 .venv/
+# A second environment with CUDA torch, used only to fit the network. The main venv
+# stays CPU-only so it matches the competition platform exactly.
+.venv-train/
 __pycache__/
 .mypy_cache/
 .ruff_cache/

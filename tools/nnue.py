@@ -279,20 +279,26 @@ def main() -> None:
     )
     arguments = parser.parse_args()
 
+    # Training is offline, so it is free to use hardware the agent never will: the platform
+    # gives one CPU core and no GPU, but nothing stops the fitting from running on one here.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        print(f"  training on {torch.cuda.get_device_name(0)}")
+
     rows, targets = cached(arguments.data, arguments.limit)
     print(f"{len(rows):,} positions, {arguments.hidden} hidden units")
     if len(rows) < 5_000:
         raise SystemExit("not enough positions to train anything trustworthy")
 
-    features = pack(rows)
+    features = pack(rows).to(device)
     count = len(rows)
     groups: list[int] = []
     if arguments.outcomes and arguments.outcomes.is_file():
         fens = [fen for fen, _ in read_fens(arguments.data, arguments.limit)]
         mixed, groups = blend_targets(fens, targets, arguments.outcomes, arguments.outcome_weight)
-        wanted = torch.tensor(mixed, dtype=torch.float32)
+        wanted = torch.tensor(mixed, dtype=torch.float32).to(device)
     else:
-        wanted = torch.sigmoid(torch.tensor(targets, dtype=torch.float32) * SCALE)
+        wanted = torch.sigmoid(torch.tensor(targets, dtype=torch.float32) * SCALE).to(device)
 
     if groups:
         # Split by game: positions from one game share a result, so splitting by position puts
@@ -300,14 +306,18 @@ def main() -> None:
         unique = sorted(set(groups))
         shuffled = [unique[i] for i in torch.randperm(len(unique)).tolist()]
         held = set(shuffled[: max(1, int(len(unique) * arguments.holdout))])
-        train = torch.tensor([i for i, g in enumerate(groups) if g not in held], dtype=torch.long)
-        test = torch.tensor([i for i, g in enumerate(groups) if g in held], dtype=torch.long)
+        train = torch.tensor(
+            [i for i, g in enumerate(groups) if g not in held], dtype=torch.long
+        ).to(device)
+        test = torch.tensor(
+            [i for i, g in enumerate(groups) if g in held], dtype=torch.long
+        ).to(device)
     else:
-        order = torch.randperm(count)
+        order = torch.randperm(count, device=device)
         split = int(count * (1.0 - arguments.holdout))
         train, test = order[:split], order[split:]
 
-    net = Network(arguments.hidden)
+    net = Network(arguments.hidden).to(device)
     if arguments.warm and arguments.warm.is_file():
         with np.load(arguments.warm) as data:
             if data["hidden_bias"].shape[0] == arguments.hidden:
@@ -322,7 +332,7 @@ def main() -> None:
     best = float("inf")
     kept = {name: tensor.detach().clone() for name, tensor in net.state_dict().items()}
     # Uniform to begin with; prioritised sampling replaces this once there are errors to rank by.
-    priority = torch.ones(len(train), dtype=torch.float64)
+    priority = torch.ones(len(train), dtype=torch.float64, device=device)
     for epoch in range(arguments.epochs):
         net.train()
         if arguments.priority > 0.0 and epoch > 0:
@@ -335,8 +345,8 @@ def main() -> None:
             weight = (1.0 / (len(train) * chance[picked])) ** arguments.correction
             batch_weight = (weight / weight.max()).float()
         else:
-            shuffled = train[torch.randperm(len(train))]
-            batch_weight = torch.ones(len(train), dtype=torch.float32)
+            shuffled = train[torch.randperm(len(train), device=device)]
+            batch_weight = torch.ones(len(train), dtype=torch.float32, device=device)
 
         total = 0.0
         for start in range(0, len(shuffled), arguments.batch):
@@ -369,7 +379,10 @@ def main() -> None:
             )
         if held < best:
             best = held
-            kept = {name: tensor.detach().clone() for name, tensor in net.state_dict().items()}
+            kept = {
+                name: tensor.detach().cpu().clone()
+                for name, tensor in net.state_dict().items()
+            }
             # Written the moment it improves: training runs long enough
             # that an interruption should not cost a result already reached.
             save(kept, arguments.out)
