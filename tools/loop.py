@@ -148,6 +148,18 @@ def main() -> None:
 
     LOG.parent.mkdir(parents=True, exist_ok=True)
     NET.parent.mkdir(parents=True, exist_ok=True)
+
+    # Resolved to an absolute path, because Windows will not find a relative one with forward
+    # slashes and fails the spawn outright. A missing interpreter falls back to this one rather
+    # than taking the night down: training slower is better than not training.
+    trainer = ""
+    if arguments.train_python:
+        candidate = Path(arguments.train_python).resolve()
+        if candidate.is_file():
+            trainer = str(candidate)
+        else:
+            print(f"no interpreter at {candidate}, training on this one instead")
+    arguments.train_python = trainer
     prepare_champion(arguments.hidden)
     note(f"loop starting: {arguments.rounds} rounds, {arguments.games} games a round")
 
