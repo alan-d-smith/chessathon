@@ -24,10 +24,13 @@ deliberate act: copy the champion over agent.py when you are satisfied with it.
 """
 
 import argparse
+import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
+from contextlib import suppress
 from pathlib import Path
 
 CHAMPION = Path("baselines/champion")
@@ -39,24 +42,50 @@ NET = Path("data/nets/loop_net.npz")
 LOG = Path("data/loop_log.txt")
 
 
-def run(command: list[str], quiet: bool = False, python: str = "") -> tuple[int, str]:
-    """Run one stage. A stage that fails should not take the loop down with it.
+def run(
+    command: list[str], quiet: bool = False, python: str = "", limit: float = 1800.0
+) -> tuple[int, str]:
+    """Run one stage under a deadline. A stuck stage must not take the night with it.
 
     `python` lets the training stage run under a different interpreter. The agent must match
     the competition environment exactly, which is CPU-only torch; fitting the network has no
     such constraint and is much faster on a GPU, so it gets its own interpreter when one exists.
+
+    The deadline is the point of this function. A pool of workers driving hundreds of agent
+    subprocesses can deadlock, and without one the loop simply stops for the rest of the night
+    with every process idle: that happened, and cost an hour before it was noticed. Killing the
+    stage is not enough either, because its workers and their agents are grandchildren and
+    outlive it, so the whole tree goes.
     """
-    finished = subprocess.run(
+    process = subprocess.Popen(
         [python or sys.executable, "-m", *command],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        check=False,
     )
-    output = (finished.stdout or "") + (finished.stderr or "")
+    try:
+        output, _ = process.communicate(timeout=limit)
+    except subprocess.TimeoutExpired:
+        kill_tree(process.pid)
+        output, _ = process.communicate()
+        print(f"      stage passed {limit / 60:.0f} min and was killed with its children")
+        return 1, output or ""
+
     if not quiet:
-        for line in output.strip().splitlines()[-3:]:
+        for line in (output or "").strip().splitlines()[-3:]:
             print(f"      {line}")
-    return finished.returncode, output
+    return process.returncode, output or ""
+
+
+def kill_tree(pid: int) -> None:
+    """Kill a stage and everything it spawned. Killing only the parent orphans the workers."""
+    if sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, check=False
+        )
+    else:
+        with suppress(ProcessLookupError):
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
 
 
 def note(message: str) -> None:
@@ -96,6 +125,12 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--priority", type=float, default=0.6)
     parser.add_argument("--workers", type=int, default=48)
+    parser.add_argument(
+        "--stage-limit",
+        type=float,
+        default=1800.0,
+        help="seconds any one stage may take before it is killed and the round abandoned",
+    )
     parser.add_argument("--openings", type=Path, default=Path("data/bigopenings.txt"))
     parser.add_argument(
         "--train-python",
@@ -135,7 +170,8 @@ def main() -> None:
                 "--append",
                 "--base-ms", "3000",
                 "--increment-ms", "30",
-            ]
+            ],
+            limit=arguments.stage_limit,
         )
         if code != 0 or not POOL.is_file():
             note(f"round {round_number}: self-play failed, skipping round")
@@ -153,7 +189,8 @@ def main() -> None:
                 "--nodes", str(arguments.nodes),
                 "--workers", str(arguments.workers),
                 "--hash-mb", "32",
-            ]
+            ],
+            limit=arguments.stage_limit,
         )
         if code != 0:
             note(f"round {round_number}: labelling failed, skipping round")
@@ -178,6 +215,7 @@ def main() -> None:
             ],
             quiet=True,
             python=arguments.train_python,
+            limit=arguments.stage_limit,
         )
         if code != 0 or not NET.is_file():
             note(f"round {round_number}: training failed, skipping round")
@@ -195,6 +233,7 @@ def main() -> None:
                 "--openings", "data/openings.txt",
             ],
             quiet=True,
+            limit=arguments.stage_limit,
         )
         verdict = [line for line in output.splitlines() if line.startswith(("elo ", "sprt:"))]
         for line in verdict:
