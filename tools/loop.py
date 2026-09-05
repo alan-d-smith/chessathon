@@ -148,6 +148,35 @@ def build_candidate(source: Path, net: Path) -> None:
     shutil.copy(net, CANDIDATE / "weights" / "net.npz")
 
 
+def launch_selfplay(arguments: argparse.Namespace, player: Path) -> subprocess.Popen:
+    """Start a round of self-play in the background and return without waiting.
+
+    Training runs on the GPU for a third of every round, and the CPU has nothing to do for all
+    of it. Generating the next round's games during that window costs nothing and recovers the
+    time. The games come from the champion as it stands when they start, which is how an actor
+    and a learner normally run: the actor plays with the latest weights it has while the learner
+    fits the next ones.
+    """
+    return subprocess.Popen(
+        [
+            sys.executable, "-m", "tools.selfplay",
+            "--white", str(player),
+            "--black", str(player),
+            "--games", str(arguments.games),
+            "--workers", str(arguments.workers),
+            "--openings", str(arguments.openings),
+            "--out", str(OUTCOMES),
+            "--fens", str(POOL),
+            "--append",
+            "--base-ms", str(arguments.play_base_ms),
+            "--increment-ms", str(arguments.play_base_ms // 100),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+
 def kill_leftovers() -> None:
     """Clear anything an abandoned round left running, so the next one starts clean."""
     if sys.platform != "win32":
@@ -233,6 +262,8 @@ def main() -> None:
             print(f"no interpreter at {candidate}, training on this one instead")
     arguments.train_python = trainer
     prepare_champion(arguments.hidden)
+    # Games for the next round, generated while this one trains and plays its match.
+    pending: subprocess.Popen | None = None
     note(f"loop starting: {arguments.rounds} rounds, {arguments.games} games a round")
 
     for round_number in range(1, arguments.rounds + 1):
@@ -241,24 +272,20 @@ def main() -> None:
             # The champion plays its own games and every position in them is kept, tagged with how
             # that game finished. This is the part that makes it self-play rather than distillation:
             # the training signal comes from what actually won, not only from what Stockfish thinks.
-            note(f"round {round_number}: the champion plays {arguments.games} games")
             player = arguments.play_agent or CHAMPION
-            code, _ = run(
-                [
-                    "tools.selfplay",
-                    "--white", str(player),
-                    "--black", str(player),
-                    "--games", str(arguments.games),
-                    "--workers", str(arguments.workers),
-                    "--openings", str(arguments.openings),
-                    "--out", str(OUTCOMES),
-                    "--fens", str(POOL),
-                    "--append",
-                    "--base-ms", str(arguments.play_base_ms),
-                    "--increment-ms", str(arguments.play_base_ms // 100),
-                ],
-                limit=arguments.stage_limit,
-            )
+            if pending is None:
+                note(f"round {round_number}: the champion plays {arguments.games} games")
+                pending = launch_selfplay(arguments, player)
+            else:
+                note(f"round {round_number}: collecting the games played during training")
+            try:
+                pending.communicate(timeout=arguments.stage_limit)
+                code = pending.returncode
+            except subprocess.TimeoutExpired:
+                kill_tree(pending.pid)
+                pending.communicate()
+                code = 1
+            pending = None
             if code != 0 or not POOL.is_file():
                 note(f"round {round_number}: self-play failed, skipping round")
                 continue
@@ -284,7 +311,10 @@ def main() -> None:
             total = sum(1 for _ in LABELS.open(encoding="utf-8"))
             note(f"round {round_number}: {total:,} labelled positions in the pool")
 
-            note(f"round {round_number}: training")
+            # The CPU is idle for the whole of training and the match. Start the next round's
+            # games now rather than after, and the two run together.
+            pending = launch_selfplay(arguments, player)
+            note(f"round {round_number}: training while the next round's games are played")
             code, output = run(
                 [
                     "tools.nnue",
@@ -353,6 +383,9 @@ def main() -> None:
         # that dies for its own reasons should cost that round, not the night.
         except Exception as failure:
             note(f"round {round_number}: abandoned, {type(failure).__name__}: {failure}")
+            if pending is not None:
+                kill_tree(pending.pid)
+                pending = None
             kill_leftovers()
 
 
