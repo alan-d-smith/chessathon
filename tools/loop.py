@@ -171,6 +171,28 @@ def main() -> None:
         help="interpreter for the training stage, e.g. a venv with CUDA torch",
     )
     parser.add_argument(
+        "--play-base-ms",
+        type=int,
+        default=8000,
+        help=(
+            "clock for the self-play games. A network agent spends about 1.7s importing "
+            "numba per process and self-play starts two processes a game, so short games "
+            "leave the machine in startup rather than searching. Longer games amortise "
+            "that and are played better, which is what the training wants."
+        ),
+    )
+    parser.add_argument(
+        "--play-agent",
+        type=Path,
+        help=(
+            "who plays the self-play games. Defaults to the champion and should stay that way: "
+            "the point of the loop is that the network trains on the positions its own play "
+            "reaches and on results produced by its own policy. Handing generation to a faster "
+            "agent triples the throughput and destroys the feedback loop, leaving a fixed "
+            "dataset from a player we are not improving."
+        ),
+    )
+    parser.add_argument(
         "--residual",
         action="store_true",
         help="train the network to correct the tuned tables rather than replace them",
@@ -206,19 +228,20 @@ def main() -> None:
         # that game finished. This is the part that makes it self-play rather than distillation:
         # the training signal comes from what actually won, not only from what Stockfish thinks.
         note(f"round {round_number}: the champion plays {arguments.games} games")
+        player = arguments.play_agent or CHAMPION
         code, _ = run(
             [
                 "tools.selfplay",
-                "--white", str(CHAMPION),
-                "--black", str(CHAMPION),
+                "--white", str(player),
+                "--black", str(player),
                 "--games", str(arguments.games),
                 "--workers", str(arguments.workers),
                 "--openings", str(arguments.openings),
                 "--out", str(OUTCOMES),
                 "--fens", str(POOL),
                 "--append",
-                "--base-ms", "3000",
-                "--increment-ms", "30",
+                "--base-ms", str(arguments.play_base_ms),
+                "--increment-ms", str(arguments.play_base_ms // 100),
             ],
             limit=arguments.stage_limit,
         )

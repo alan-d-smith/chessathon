@@ -366,6 +366,15 @@ def load_net() -> bool:
     if not path.is_file():
         return False
     try:
+        # numba compiles at import and caches the result next to the source, which is read only
+        # on the platform. Pointing it at the writable scratch directory first means the compile
+        # is paid once per machine rather than once per process: about 2.4 seconds either way
+        # here, but that is 2.4 seconds of the init budget on every game, and hours across a
+        # self-play run that starts two processes per game.
+        import os
+        import tempfile
+
+        os.environ.setdefault("NUMBA_CACHE_DIR", tempfile.gettempdir())
         import numpy as np
         from numba import njit
     except ImportError:
@@ -390,7 +399,7 @@ def load_net() -> bool:
     for square in range(64):
         table[(((1 << square) * 0x03F79D71B4CB0A89) & 0xFFFFFFFFFFFFFFFF) >> 58] = square
 
-    @njit(cache=False)
+    @njit(cache=True)
     def forward(  # type: ignore[no-untyped-def]  # numba infers these from the call site
         pawns, knights, bishops, rooks, queens, kings, ours, theirs, flip,
         weight_in, bias_in, weight_out, bias_out, lookup, magic,
