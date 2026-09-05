@@ -12,7 +12,8 @@ search abandons a depth rather than finish it, and get_move always has a legal m
 
 import time
 from collections.abc import Hashable, Iterator
-from typing import Final
+from pathlib import Path
+from typing import Any, Final
 
 import chess
 
@@ -344,6 +345,143 @@ def evaluate(board: chess.Board) -> int:
     score += weight[TEMPO] if board.turn == chess.WHITE else -weight[TEMPO]
 
     return score if board.turn == chess.WHITE else -score
+
+
+# An optional network, used only when weights/net.npz ships alongside this file. numpy and
+# numba are imported inside the loader rather than at the top, so an agent without a network
+# pays nothing for the possibility of one: no import cost, no compile, no new way to fail.
+# Typed loosely on purpose: numpy and numba are not imported unless a network ships, so
+# nothing here can be given a real type at module scope without importing them.
+net_forward: Any = None
+net_state: dict[str, Any] = {}
+
+
+def load_net() -> bool:
+    """Load and compile the network if one shipped. Returning False keeps the tables."""
+    path = Path(__file__).resolve().parent / "weights" / "net.npz"
+    if not path.is_file():
+        return False
+    try:
+        import numpy as np
+        from numba import njit
+    except ImportError:
+        return False
+
+    try:
+        with np.load(path) as data:
+            hidden_w = np.ascontiguousarray(data["hidden_weight"], dtype=np.float32)
+            hidden_b = np.ascontiguousarray(data["hidden_bias"], dtype=np.float32)
+            out_w = np.ascontiguousarray(data["output_weight"], dtype=np.float32)
+            out_b = float(data["output_bias"][0])
+    except (OSError, KeyError, ValueError, IndexError):
+        return False
+    if hidden_w.shape != (768, hidden_b.shape[0]) or out_w.shape != hidden_b.shape:
+        return False
+
+    # numba has no bit_length for a uint64, so squares come out of a bitboard by de Bruijn.
+    # Built with Python integers and masked by hand: the wrap it relies on is what numpy would
+    # call an overflow, and it would warn on every import for something entirely intended.
+    table = np.zeros(64, dtype=np.int64)
+    for square in range(64):
+        table[(((1 << square) * 0x03F79D71B4CB0A89) & 0xFFFFFFFFFFFFFFFF) >> 58] = square
+
+    @njit(cache=False)
+    def forward(  # type: ignore[no-untyped-def]  # numba infers these from the call site
+        pawns, knights, bishops, rooks, queens, kings, ours, theirs, flip,
+        weight_in, bias_in, weight_out, bias_out, lookup, magic,
+    ):
+        """Centipawns from the side to move. One call, taking the raw bitboards.
+
+        Pulling the piece squares out in Python first would cost more than the network does.
+        A full refresh each call rather than an accumulator kept in step with make and unmake:
+        at this width refreshing is fast enough, and it cannot fall out of step with the board.
+        """
+        hidden = bias_in.copy()
+        for piece in range(6):
+            if piece == 0:
+                board = pawns
+            elif piece == 1:
+                board = knights
+            elif piece == 2:
+                board = bishops
+            elif piece == 3:
+                board = rooks
+            elif piece == 4:
+                board = queens
+            else:
+                board = kings
+            for owner in range(2):
+                squares = board & (ours if owner == 0 else theirs)
+                base = owner * 384 + piece * 64
+                while squares:
+                    lowest = squares & (~squares + np.uint64(1))
+                    square = lookup[(lowest * magic) >> np.uint64(58)]
+                    if flip:
+                        # Mirror so our own first rank is always the bottom of the board, which
+                        # is what lets one set of weights serve both colours.
+                        square = square ^ 56
+                    index = base + square
+                    for unit in range(hidden.shape[0]):
+                        hidden[unit] += weight_in[index, unit]
+                    squares ^= lowest
+
+        total = bias_out
+        for unit in range(hidden.shape[0]):
+            value = hidden[unit]
+            if value > 0.0:
+                total += value * weight_out[unit]
+        return total
+
+    global net_forward
+    net_forward = forward
+    net_state.update(
+        numpy=np,
+        hidden_w=hidden_w,
+        hidden_b=hidden_b,
+        out_w=out_w,
+        out_b=out_b,
+        table=table,
+        magic=np.uint64(0x03F79D71B4CB0A89),
+    )
+    return True
+
+
+def evaluate_net(board: chess.Board) -> int:
+    """The network's view, in centipawns from the side to move."""
+    np = net_state["numpy"]
+    white = board.occupied_co[chess.WHITE]
+    black = board.occupied_co[chess.BLACK]
+    mover_is_white = board.turn == chess.WHITE
+    ours, theirs = (white, black) if mover_is_white else (black, white)
+    return int(
+        net_forward(
+            np.uint64(board.pawns),
+            np.uint64(board.knights),
+            np.uint64(board.bishops),
+            np.uint64(board.rooks),
+            np.uint64(board.queens),
+            np.uint64(board.kings),
+            np.uint64(ours),
+            np.uint64(theirs),
+            not mover_is_white,
+            net_state["hidden_w"],
+            net_state["hidden_b"],
+            net_state["out_w"],
+            net_state["out_b"],
+            net_state["table"],
+            net_state["magic"],
+        )
+    )
+
+
+USING_NET: Final = load_net()
+
+if USING_NET:
+    # numba compiles on the first call, and that call costs far more than the move it would be
+    # part of. Spending it here puts it inside the 90 second import budget rather than on the
+    # clock, warmed with the argument types the real calls will use.
+    evaluate_net(chess.Board())
+    evaluate = evaluate_net
 
 
 def capture_value(board: chess.Board, move: chess.Move) -> int:
