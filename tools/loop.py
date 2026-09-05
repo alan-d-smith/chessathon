@@ -163,7 +163,10 @@ def main() -> None:
     parser.add_argument("--rounds", type=int, default=100)
     parser.add_argument("--games", type=int, default=3000, help="self-play games a round")
     parser.add_argument("--nodes", type=int, default=50_000, help="labelling depth")
-    parser.add_argument("--hidden", type=int, default=32)
+    # 64 is what the shipped network uses. A mismatch here silently declines the warm
+    # start, because the stored weights cannot be loaded into a different shape, and
+    # every round then trains from scratch instead of building on the last one.
+    parser.add_argument("--hidden", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--priority", type=float, default=0.6)
     parser.add_argument("--workers", type=int, default=48)
