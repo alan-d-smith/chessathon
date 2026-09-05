@@ -39,6 +39,11 @@ POOL = Path("data/loop_positions.txt")
 OUTCOMES = Path("data/loop_outcomes.jsonl")
 LABELS = Path("data/loop_labelled.jsonl")
 NET = Path("data/nets/loop_net.npz")
+# The best candidate so far, by match result rather than by training loss. Warm starting from
+# the previous round regardless of whether it was any good is a random walk; starting from the
+# best one measured makes it a climb.
+BEST = Path("data/nets/loop_best.npz")
+BEST_SCORE = Path("data/nets/loop_best.txt")
 LOG = Path("data/loop_log.txt")
 
 
@@ -94,6 +99,27 @@ def note(message: str) -> None:
     print(line, flush=True)
     with LOG.open("a", encoding="utf-8") as handle:
         handle.write(line + "\n")
+
+
+def elo_of(verdict: list[str]) -> float | None:
+    """The Elo line from a match report, as a number."""
+    for line in verdict:
+        if line.startswith("elo "):
+            try:
+                return float(line.split()[1])
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+def read_best() -> float:
+    """How good the best candidate so far was. Nothing yet means anything is an improvement."""
+    if not BEST_SCORE.is_file():
+        return float("-inf")
+    try:
+        return float(BEST_SCORE.read_text(encoding="utf-8").strip())
+    except ValueError:
+        return float("-inf")
 
 
 def prepare_champion(hidden: int) -> None:
@@ -223,7 +249,7 @@ def main() -> None:
                 # Both signals: the engine score for precision, the game result for truth.
                 "--outcomes", str(OUTCOMES),
                 "--outcome-weight", str(arguments.outcome_weight),
-                *(["--warm", str(NET)] if NET.is_file() else []),
+                *(["--warm", str(BEST)] if BEST.is_file() else []),
             ],
             quiet=True,
             python=arguments.train_python,
@@ -250,6 +276,19 @@ def main() -> None:
         verdict = [line for line in output.splitlines() if line.startswith(("elo ", "sprt:"))]
         for line in verdict:
             note(f"round {round_number}: {line.strip()}")
+
+        # Keep the best candidate measured, not the most recent one trained, and start the next
+        # round from it. Round 2 fitted the labels better than round 1 and played 38 Elo worse,
+        # which is exactly the case where following the training loss walks downhill.
+        measured = elo_of(verdict)
+        if measured is not None:
+            previous = read_best()
+            if measured > previous:
+                shutil.copy(NET, BEST)
+                BEST_SCORE.write_text(f"{measured:.1f}" + chr(10), encoding="utf-8")
+                note(f"round {round_number}: best candidate so far at {measured:+.0f} elo")
+            else:
+                note(f"round {round_number}: keeping the {previous:+.0f} elo net to build on")
 
         if any("accepted" in line for line in verdict):
             shutil.copy(NET, Path("data/nets") / f"champion_r{round_number}.npz")
