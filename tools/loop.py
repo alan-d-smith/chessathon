@@ -204,7 +204,10 @@ def launch_selfplay(arguments: argparse.Namespace, player: Path, games: int) -> 
     """
     return subprocess.Popen(
         [
-            sys.executable, "-m", "tools.selfplay",
+            # Unbuffered, because its output goes to a file rather than a terminal and
+            # python would otherwise hold progress in an 8k buffer for the best part of
+            # an hour, which is exactly when someone wants to know whether it is alive.
+            sys.executable, "-u", "-m", "tools.selfplay",
             "--white", str(player),
             "--black", str(player),
             "--games", str(games),
