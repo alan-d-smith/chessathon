@@ -55,12 +55,16 @@ BEST_SCORE = Path("data/nets/loop_best.txt")
 GAMES_STATE = Path("data/nets/loop_games.txt")
 LOG = Path("data/loop_log.txt")
 
-# How far the game count moves when a round says it was wrong. A round is the only measurement
-# available, so this trades how fast the volume converges against how far it overshoots once
-# it is there: at a fifth, it settles within about one round of the right number.
-GAMES_STEP = 1.2
+# Self-play is the only thing keeping the cpu busy, so it has to last the whole round rather
+# than just the training stage: when it stopped early the machine sat at 3% for a quarter of an
+# hour with seventy of seventy-two cores idle. The outcomes file is flushed after every game,
+# so its mtime is when self-play actually ended, and the ratio of that to the round it was meant
+# to cover is the exact correction. Damped a little because a round's length varies with whether
+# it ran a confirmation match, and bounded so one strange round cannot run away with it.
+GAMES_DAMPING = 0.7
+GAMES_MAX_STEP = 3.0
 GAMES_FLOOR = 400
-GAMES_CEILING = 40_000
+GAMES_CEILING = 200_000
 
 
 def run(
@@ -254,6 +258,10 @@ def main() -> None:
     # reliable +12 is a test built to say no. elo0 stays at zero, so the guard against
     # promoting a regression is untouched; only the size of win worth having comes down.
     parser.add_argument("--elo1", type=float, default=8.0)
+    # The matches run beside self-play now, so the two pools share the machine. Sized together
+    # rather than each taking four fifths of it, which would be half as many cores again as
+    # the box has.
+    parser.add_argument("--match-workers", type=int, default=28)
     parser.add_argument(
         "--train-python",
         type=str,
@@ -313,6 +321,8 @@ def main() -> None:
     # Games for the next round, generated while this one trains and plays its match.
     pending: subprocess.Popen | None = None
     games = read_games(arguments.games)
+    # Only read after a round that launched games, but a round can end early enough not to.
+    launched_at = time.time()
     note(f"loop starting: {arguments.rounds} rounds, {games} games a round to begin with")
 
     for round_number in range(1, arguments.rounds + 1):
@@ -363,6 +373,7 @@ def main() -> None:
             # The CPU is idle for the whole of training and the match. Start the next round's
             # games now rather than after, and the two run together.
             pending = launch_selfplay(arguments, player, games)
+            launched_at = time.time()
             note(f"round {round_number}: training while the next round's games are played")
             code, output = run(
                 [
@@ -389,22 +400,6 @@ def main() -> None:
             holdout = [line for line in output.splitlines() if "best holdout" in line]
             note(f"round {round_number}: {holdout[-1].strip() if holdout else 'trained'}")
 
-            # Self-play holds the CPU while training holds the GPU, and the only thing that
-            # matters is whether it lasted as long as training did. Finishing early leaves the
-            # machine idle for the rest of the window, which was costing a third of every
-            # round; still running when the match starts stacks a match pool on top of a
-            # self-play pool, which is what deadlocked this loop once already. Polling here is
-            # that measurement, taken at the one boundary where the answer is actionable, and
-            # the volume for the next round follows it. Held on a failed round, where the
-            # window was cut short and the signal would say nothing about the machine.
-            if pending is not None:
-                if pending.poll() is None:
-                    games = max(GAMES_FLOOR, round(games / GAMES_STEP))
-                    note(f"round {round_number}: games outlasted training, next round plays {games}")
-                else:
-                    games = min(GAMES_CEILING, round(games * GAMES_STEP))
-                    note(f"round {round_number}: idle cpu left in training, next round plays {games}")
-                GAMES_STATE.write_text(f"{games}" + chr(10), encoding="utf-8")
 
             note(f"round {round_number}: playing the champion")
             build_candidate(CHAMPION, NET)
@@ -415,6 +410,7 @@ def main() -> None:
                     "--opponent", str(CHAMPION),
                     "--openings", str(arguments.match_openings),
                     "--elo1", str(arguments.elo1),
+                    "--workers", str(arguments.match_workers),
                 ],
                 quiet=True,
                 limit=arguments.stage_limit,
@@ -451,6 +447,7 @@ def main() -> None:
                         "--opponent", str(CHAMPION),
                         "--openings", str(arguments.confirm_openings),
                         "--elo1", str(arguments.elo1),
+                        "--workers", str(arguments.match_workers),
                     ],
                     quiet=True,
                     limit=arguments.stage_limit,
@@ -481,7 +478,26 @@ def main() -> None:
             else:
                 note(f"round {round_number}: rejected, champion unchanged")
 
-            note(f"round {round_number}: done in {(time.monotonic() - started) / 60:.1f} min")
+            # How long the games actually lasted against the round they had to cover. Still
+            # running means they covered it, and the ratio is one. Finished early means the
+            # cpu was idle from that moment, and the ratio says by exactly how much.
+            round_seconds = time.monotonic() - started
+            if pending is not None and pending.poll() is not None and OUTCOMES.is_file():
+                played_for = max(1.0, OUTCOMES.stat().st_mtime - launched_at)
+                ratio = min(GAMES_MAX_STEP, max(1.0, round_seconds / played_for))
+                scaled = games * (1.0 + (ratio - 1.0) * GAMES_DAMPING)
+                games = max(GAMES_FLOOR, min(GAMES_CEILING, round(scaled)))
+                idle = round_seconds - played_for
+                note(
+                    f"round {round_number}: games ran {played_for / 60:.1f} min of a "
+                    f"{round_seconds / 60:.1f} min round, {idle / 60:.1f} min idle, "
+                    f"next round plays {games}"
+                )
+                GAMES_STATE.write_text(f"{games}" + chr(10), encoding="utf-8")
+            else:
+                note(f"round {round_number}: games covered the whole round, holding at {games}")
+
+            note(f"round {round_number}: done in {round_seconds / 60:.1f} min")
         # Any escape here would end a run meant to last until somebody stops it. A round
         # that dies for its own reasons should cost that round, not the night.
         except Exception as failure:
