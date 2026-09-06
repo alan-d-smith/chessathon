@@ -11,6 +11,7 @@ search abandons a depth rather than finish it, and get_move always has a legal m
 """
 
 import time
+from collections import Counter
 from collections.abc import Hashable, Iterator
 from pathlib import Path
 from typing import Any, Final
@@ -67,6 +68,9 @@ VALUE: Final = {
 TOTAL_PHASE: Final = 24
 
 TT_LIMIT: Final = 400_000
+# Walking back to a position seen once is worth discouraging, not forbidding: sometimes
+# it is the only move. Walking into the third occurrence is not a matter of degree, and
+# is scored below as the draw it actually is.
 REPETITION_PENALTY: Final = 40
 
 # Search shaping. Alpha-beta only pays off when it can cut, so these decide what never gets
@@ -220,7 +224,10 @@ class Timeout(Exception):
 transposition: dict[Hashable, tuple[int, int, int, chess.Move | None]] = {}
 killers: list[list[chess.Move | None]] = [[None, None] for _ in range(MAX_DEPTH + 2)]
 history: dict[tuple[int, int], int] = {}
-seen: set[Hashable] = set()
+# Counted, not just remembered. The referee claims the draw on the third occurrence, so
+# the difference between having been somewhere once and twice is the difference between
+# a nudge away from a line and the line being worth exactly nothing.
+seen: Counter[Hashable] = Counter()
 
 nodes = 0
 deadline = 0.0
@@ -896,7 +903,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
     # the test able to match at all: a key carries the side to move, so a position with us to
     # move can never equal one with them to move. Without the move played below, this check
     # was dead code that had never once fired.
-    seen.add(board._transposition_key())
+    seen[board._transposition_key()] += 1
     soft, hard = budget_s(time_left_ms, board.fullmove_number)
     deadline = started + soft
     nodes = 0
@@ -907,6 +914,9 @@ def get_move(fen: str, time_left_ms: int) -> str:
     choice = legal[0]
     settled: chess.Move | None = None
     previous_score = -INFINITY
+    # Nothing stood in twice means no threefold is reachable, and the scan below can be skipped
+    # entirely, which is every move of a normal game.
+    repeatable = any(count >= 2 for count in seen.values())
 
     # A position the tables cover is already solved, and a search can only be wrong about it.
     # Costs one popcount on every other move, which is nothing.
@@ -914,7 +924,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
         answer = tablebase_move(board)
         if answer is not None:
             board.push(answer)
-            seen.add(board._transposition_key())
+            seen[board._transposition_key()] += 1
             board.pop()
             last_clock_ms = float(time_left_ms)
             last_spent_ms = (time.monotonic() - started) * 1000.0
@@ -929,12 +939,32 @@ def get_move(fen: str, time_left_ms: int) -> str:
             for move in candidates(board, choice, 0):
                 board.push(move)
                 score = -negamax(board, depth - 1, -INFINITY, -alpha, 1)
-                # Returning to a position our own play has already produced walks towards the
-                # threefold the referee claims automatically, so it is only worth it when we
-                # are worse. A won game can otherwise be drawn without ever being told.
-                repeated = board._transposition_key() in seen
+                # Returning to a position our own play has already produced walks towards
+                # the threefold the referee claims automatically, so it is only worth it when
+                # we are worse. A won game can otherwise be drawn without ever being told, and
+                # round 42 was: two rooks up at +1500, the search took a check that repeated
+                # for the third time, and a forty point nudge was never going to outweigh it.
+                # A third occurrence is not worth its evaluation minus a penalty. It is worth
+                # a draw, because that is what the referee will score it.
+                before = seen[board._transposition_key()]
+                # The referee claims the threefold on whatever position occurs three times,
+                # and in round 42 that was the one after the opponent's reply, not the one
+                # after our move: we checked, they had a single legal answer, and the draw
+                # was theirs to take. So a winning side has to look one further ply. Guarded
+                # by repeatable, because with nothing seen twice there is nothing to find,
+                # and by the score, because a draw is only worth refusing when we are winning.
+                drawn = before >= 2
+                if not drawn and repeatable and score > 0:
+                    for reply in board.legal_moves:
+                        board.push(reply)
+                        drawn = seen[board._transposition_key()] >= 2
+                        board.pop()
+                        if drawn:
+                            break
                 board.pop()
-                if repeated and score > 0:
+                if drawn:
+                    score = 0
+                elif before and score > 0:
                     score -= REPETITION_PENALTY
                 if score > best_score:
                     best_score = score
@@ -967,9 +997,9 @@ def get_move(fen: str, time_left_ms: int) -> str:
             extensions += 1
         deadline = started + (hard if unstable else soft)
 
-    # Remember where this move leaves the board, so a later move returning here is recognised.
+    # Remember where this move leaves the board, so a later move returning here is counted.
     board.push(choice)
-    seen.add(board._transposition_key())
+    seen[board._transposition_key()] += 1
     board.pop()
 
     last_clock_ms = float(time_left_ms)
