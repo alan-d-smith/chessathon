@@ -471,7 +471,29 @@ def load_net() -> bool:
         table=table,
         magic=np.uint64(0x03F79D71B4CB0A89),
     )
-    return True
+
+    # numba compiles on the first call, not at decoration, so the warm-up below is also where
+    # a broken cache first shows itself. It can break for reasons that have nothing to do with
+    # us: a cache directory that is not writable, a half written entry, or an entry pickled
+    # against a module name that no longer exists. Every one of those raises, and an exception
+    # here would be raised at import, which loses every game of the round rather than one move.
+    # So the cache is an optimisation that is allowed to fail: compile fresh without it, and
+    # failing that, play on the tables alone.
+    try:
+        evaluate_net(chess.Board())
+        return True
+    # Whatever the cache did, it must not reach the referee.
+    except Exception:
+        pass
+    try:
+        # The same function compiled in memory. Costs the compile on every process instead of
+        # once per machine, which is seconds of the init budget rather than the whole game.
+        net_forward = njit(cache=False)(forward.py_func)
+        evaluate_net(chess.Board())
+        return True
+    # The tables are always there.
+    except Exception:
+        return False
 
 
 def evaluate_net(board: chess.Board) -> int:
@@ -516,10 +538,9 @@ def evaluate_residual(board: chess.Board) -> int:
 USING_NET: Final = load_net()
 
 if USING_NET:
-    # numba compiles on the first call, and that call costs far more than the move it would be
-    # part of. Spending it here puts it inside the 90 second import budget rather than on the
-    # clock, warmed with the argument types the real calls will use.
-    evaluate_net(chess.Board())
+    # load_net has already made the first call, which is what compiles the network and what
+    # pays for it: inside the 90 second import budget rather than on the clock, and warmed with
+    # the argument types the real calls will use. Reaching here means that call succeeded.
     evaluate = evaluate_residual if net_state.get("residual") else evaluate_net
 
 
