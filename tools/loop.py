@@ -61,6 +61,15 @@ SELFPLAY_GAMES = 10_000_000
 SELFPLAY_LOG = Path("data/loop_selfplay.txt")
 _SELFPLAY_HANDLE = None
 
+# A fixed number of epochs is a fixed number of passes over a pool that grows every round, so
+# the training stage gets slower for as long as the loop runs and eventually stops finishing:
+# at nine million positions, 250 epochs ran past the fifty minute stage limit and the round was
+# skipped. What should stay constant is the work, not the passes, so the epochs come from how
+# much data there is. The cap is what was asked for, and the floor stops a very large pool from
+# training on a single glance at it.
+TARGET_SAMPLES = 1_000_000_000
+MIN_EPOCHS = 25
+
 
 def run(
     command: list[str], quiet: bool = False, python: str = "", limit: float = 1800.0
@@ -116,14 +125,29 @@ def note(message: str) -> None:
         handle.write(line + "\n")
 
 
+# An Elo estimate is only worth reading when the games behind it decided something. A match
+# where every game was void reports a saturated number with a zero interval, and that is what
+# a broken agent looks like from here rather than a good one. It happened: while a poisoned
+# numba cache was killing every game, two rounds reported "+800 +/- 0", the best so far was set
+# to 800, and nothing could ever beat it again -- the warm start was pinned exactly as it had
+# been before, this time by garbage instead of a stale scale.
+ELO_LIMIT = 600.0
+
+
 def elo_of(verdict: list[str]) -> float | None:
-    """The Elo line from a match report, as a number."""
+    """The Elo line from a match report, or None when the match said nothing."""
     for line in verdict:
-        if line.startswith("elo "):
-            try:
-                return float(line.split()[1])
-            except (IndexError, ValueError):
-                return None
+        if not line.startswith("elo "):
+            continue
+        parts = line.split()
+        try:
+            measured, interval = float(parts[1]), float(parts[3])
+        except (IndexError, ValueError):
+            return None
+        # A zero interval means no game decided anything; an absurd size means the same.
+        if interval <= 0.0 or abs(measured) > ELO_LIMIT:
+            return None
+        return measured
     return None
 
 
@@ -357,7 +381,11 @@ def main() -> None:
                 note(f"round {round_number}: labelling failed, skipping round")
                 continue
             total = sum(1 for _ in LABELS.open(encoding="utf-8"))
-            note(f"round {round_number}: {total:,} labelled positions in the pool")
+            epochs = max(MIN_EPOCHS, min(arguments.epochs, TARGET_SAMPLES // max(total, 1)))
+            note(
+                f"round {round_number}: {total:,} labelled positions in the pool, "
+                f"{epochs} epochs"
+            )
 
             # The CPU is idle for the whole of training and the match. Start the next round's
             # games now rather than after, and the two run together.
@@ -368,7 +396,7 @@ def main() -> None:
                     "--data", str(LABELS),
                     "--out", str(NET),
                     "--hidden", str(arguments.hidden),
-                    "--epochs", str(arguments.epochs),
+                    "--epochs", str(epochs),
                     "--rate", "3e-3",
                     "--priority", str(arguments.priority),
                     # Both signals: the engine score for precision, the game result for truth.
