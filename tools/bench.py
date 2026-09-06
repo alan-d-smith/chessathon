@@ -16,9 +16,9 @@ import cProfile
 import importlib
 import pstats
 import time
+from types import ModuleType
 
 import chess
-from types import ModuleType
 
 POSITIONS: tuple[tuple[str, str], ...] = (
     ("start", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),

@@ -48,7 +48,7 @@ def fetch(task: tuple[str, Path, float, int]) -> tuple[str, int, str]:
             request = urllib.request.Request(BASE + name, headers=HEADERS)
             with urllib.request.urlopen(request, timeout=timeout) as body:
                 blob = body.read()
-        except Exception as failure:  # noqa: BLE001 - every network error is worth another go
+        except Exception as failure:
             if attempt + 1 == attempts:
                 return name, 0, f"failed: {type(failure).__name__}"
             time.sleep(2**attempt)
