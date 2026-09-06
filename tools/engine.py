@@ -31,8 +31,13 @@ def binary() -> str:
     raise RuntimeError("no stockfish binary found; set SF_BIN to its path")
 
 
-def spawn(hash_mb: int = 64) -> chess.engine.SimpleEngine:
-    """One engine, one thread. Parallelism here is one process per core, not one engine."""
-    engine = chess.engine.SimpleEngine.popen_uci(binary())
+def spawn(hash_mb: int = 64, timeout: float = 120.0) -> chess.engine.SimpleEngine:
+    """One engine, one thread. Parallelism here is one process per core, not one engine.
+
+    The startup timeout is generous because these tools run beside a loop that keeps every
+    core busy, and the default ten seconds is not enough for a process to finish handshaking
+    on a machine under that kind of load.
+    """
+    engine = chess.engine.SimpleEngine.popen_uci(binary(), timeout=timeout)
     engine.configure({"Threads": 1, "Hash": hash_mb})
     return engine
