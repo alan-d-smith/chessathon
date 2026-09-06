@@ -533,8 +533,9 @@ def tablebase_move(board: chess.Board) -> chess.Move | None:
     move or capture that resets the fifty move count, and from there to mate.
     """
     best: chess.Move | None = None
-    best_key: tuple[int, int] | None = None
+    best_key: tuple[int, int, int, int] | None = None
     for move in board.legal_moves:
+        zeroing = board.is_capture(move) or board.piece_type_at(move.from_square) == chess.PAWN
         board.push(move)
         try:
             if board.is_checkmate():
@@ -547,11 +548,27 @@ def tablebase_move(board: chess.Board) -> chess.Move | None:
         except Exception:
             board.pop()
             return None
+        repeat = board._transposition_key() in seen
         board.pop()
-        # Win first. Then, when winning, the shortest distance to zero; when losing, the
-        # longest, because the fifty move rule is the only thing that can still save us.
+
+        # Win first. Then never repeat a won position: distance to zero counts plies to the
+        # next pawn move or capture, not to mate, so every king move in a won pawn ending can
+        # share one distance and the choice between them falls to whatever came first. That is
+        # how king and two pawns against a bare king was drawn by repetition. Then the shortest
+        # distance when winning and the longest when losing, and finally a zeroing move, which
+        # is the one that actually resets the fifty move count and moves the game forward.
+        walking = 0 if (repeat and outcome > 0) else 1
         progress = -abs(distance) if outcome > 0 else abs(distance)
-        key = (outcome, progress)
+        forward = (1 if zeroing else 0) if outcome > 0 else (0 if zeroing else 1)
+        # When winning, a zeroing move outranks the distance. Distance to zero counts plies to
+        # the next pawn move or capture by either side, so a defender with a pawn can keep
+        # resetting it and the number stops describing our progress at all: rook against king
+        # and pawn sat at a distance of one while the rook toured the eighth rank. Every move
+        # considered here already holds the win, so taking the one that resets the fifty move
+        # count cannot throw it away, and it is the only thing that reliably ends the game.
+        key = (outcome, walking, forward, progress) if outcome > 0 else (
+            outcome, walking, progress, forward
+        )
         if best_key is None or key > best_key:
             best, best_key = move, key
     return best
