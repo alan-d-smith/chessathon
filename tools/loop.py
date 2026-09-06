@@ -207,6 +207,24 @@ def main() -> None:
     )
     parser.add_argument("--openings", type=Path, default=Path("data/bigopenings.txt"))
     parser.add_argument(
+        "--match-openings",
+        type=Path,
+        default=Path("data/openings.txt"),
+        help="the suite the promotion match is decided on",
+    )
+    parser.add_argument(
+        "--confirm-openings",
+        type=Path,
+        default=Path("data/openings_confirm.txt"),
+        help="a second suite, played only by a candidate that has already won, before it is kept",
+    )
+    # Thirty-one rounds running the whole suite and reporting "inconclusive" is a bar set
+    # above what the loop actually yields: measured over nineteen rounds against one champion,
+    # a round is worth +12 elo and 18 of 19 were positive. Asking "is this worth 15" of a
+    # reliable +12 is a test built to say no. elo0 stays at zero, so the guard against
+    # promoting a regression is untouched; only the size of win worth having comes down.
+    parser.add_argument("--elo1", type=float, default=8.0)
+    parser.add_argument(
         "--train-python",
         type=str,
         default="",
@@ -347,7 +365,8 @@ def main() -> None:
                     "tools.match",
                     "--agent", str(CANDIDATE),
                     "--opponent", str(CHAMPION),
-                    "--openings", "data/openings.txt",
+                    "--openings", str(arguments.match_openings),
+                    "--elo1", str(arguments.elo1),
                 ],
                 quiet=True,
                 limit=arguments.stage_limit,
@@ -369,11 +388,47 @@ def main() -> None:
                 else:
                     note(f"round {round_number}: keeping the {previous:+.0f} elo net to build on")
 
-            if any("accepted" in line for line in verdict):
+            promote = any("accepted" in line for line in verdict)
+            if promote:
+                # One suite deciding alone promotes whatever beat the champion on those
+                # positions, noise included, and a lower bar makes that likelier. A second
+                # suite the candidate has never been measured on has to agree before the
+                # champion changes, so a win has to be a property of the network rather than
+                # of three hundred openings.
+                note(f"round {round_number}: confirming on a suite it has not played")
+                code, output = run(
+                    [
+                        "tools.match",
+                        "--agent", str(CANDIDATE),
+                        "--opponent", str(CHAMPION),
+                        "--openings", str(arguments.confirm_openings),
+                        "--elo1", str(arguments.elo1),
+                    ],
+                    quiet=True,
+                    limit=arguments.stage_limit,
+                )
+                confirmation = [
+                    line for line in output.splitlines() if line.startswith(("elo ", "sprt:"))
+                ]
+                for line in confirmation:
+                    note(f"round {round_number}: confirm: {line.strip()}")
+                promote = any("accepted" in line for line in confirmation)
+                if not promote:
+                    note(f"round {round_number}: confirmation did not agree, champion unchanged")
+
+            if promote:
                 shutil.copy(NET, Path("data/nets") / f"champion_r{round_number}.npz")
                 (CHAMPION / "weights").mkdir(parents=True, exist_ok=True)
                 shutil.copy(NET, CHAMPION / "weights" / "net.npz")
                 shutil.copy(CANDIDATE / "agent.py", CHAMPION / "agent.py")
+                # The opponent just changed, so every Elo measured against the old champion is
+                # on a different scale. Keeping the old number here is what pinned the warm
+                # start to round 2's network for twenty rounds: round 14 won its match at +43,
+                # lost the comparison to a +73 measured against a weaker champion, and the loop
+                # kept building on a network the champion had already overtaken. A champion is
+                # zero against itself, and the network to build on is now its own.
+                shutil.copy(NET, BEST)
+                BEST_SCORE.write_text("0.0" + chr(10), encoding="utf-8")
                 note(f"round {round_number}: PROMOTED, the champion now uses the network")
             else:
                 note(f"round {round_number}: rejected, champion unchanged")

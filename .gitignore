@@ -12,3 +12,6 @@ submission.zip
 # it is the yardstick every A/B match is measured on, so it has to stay fixed across sessions.
 data/*
 !data/openings.txt
+# The second suite exists to disagree with the first, so a candidate that only beat three
+# hundred lucky positions cannot be promoted. That is only true while it stays fixed too.
+!data/openings_confirm.txt
