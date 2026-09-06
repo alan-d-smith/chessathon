@@ -222,6 +222,27 @@ def launch_selfplay(arguments: argparse.Namespace, player: Path, games: int) -> 
     )
 
 
+def keep_playing(
+    pending: subprocess.Popen | None,
+    arguments: argparse.Namespace,
+    player: Path,
+    games: int,
+    round_number: int,
+) -> subprocess.Popen:
+    """Restart the games if they have stopped, and say so.
+
+    Self-play is the only thing on the cpu while the gpu trains, so when it dies the machine
+    goes quiet until the next round notices -- eight minutes of seventy-two idle cores, the
+    first time it happened. A round is long, so this is checked at every stage boundary rather
+    than only at the start of one.
+    """
+    if pending is not None and pending.poll() is None:
+        return pending
+    if pending is not None:
+        note(f"round {round_number}: the games had stopped, starting them again")
+    return launch_selfplay(arguments, player, games)
+
+
 def kill_leftovers() -> None:
     """Clear anything an abandoned round left running, so the next one starts clean."""
     if sys.platform != "win32":
@@ -389,6 +410,7 @@ def main() -> None:
 
             # The CPU is idle for the whole of training and the match. Start the next round's
             # games now rather than after, and the two run together.
+            pending = keep_playing(pending, arguments, player, games, round_number)
             note(f"round {round_number}: training while the games keep playing")
             code, output = run(
                 [
@@ -416,6 +438,7 @@ def main() -> None:
             note(f"round {round_number}: {holdout[-1].strip() if holdout else 'trained'}")
 
 
+            pending = keep_playing(pending, arguments, player, games, round_number)
             note(f"round {round_number}: playing the champion")
             build_candidate(CHAMPION, NET)
             code, output = run(
@@ -454,6 +477,7 @@ def main() -> None:
                 # suite the candidate has never been measured on has to agree before the
                 # champion changes, so a win has to be a property of the network rather than
                 # of three hundred openings.
+                pending = keep_playing(pending, arguments, player, games, round_number)
                 note(f"round {round_number}: confirming on a suite it has not played")
                 code, output = run(
                     [

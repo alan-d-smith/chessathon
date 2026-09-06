@@ -36,7 +36,13 @@ def one(task: tuple[Path, Path, str, bool, int, int]) -> tuple[float, str, str]:
     """
     agent, opponent, fen, agent_is_white, base_ms, increment_ms = task
     white, black = (agent, opponent) if agent_is_white else (opponent, agent)
-    outcome = play_match(local(white), local(black), base_ms, increment_ms, start_fen=fen)
+    try:
+        outcome = play_match(local(white), local(black), base_ms, increment_ms, start_fen=fen)
+    # A harness failure is not a chess result. Counting it as a draw and naming it keeps one
+    # broken game from ending a match that has hundreds of good ones left in it, and the count
+    # shows up in the report rather than hiding inside a score.
+    except Exception:
+        return 0.5, "harness_error", "both"
 
     if outcome.result == "void":
         return 0.5, outcome.termination, "both"
