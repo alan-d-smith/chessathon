@@ -50,21 +50,16 @@ NET = Path("data/nets/loop_net.npz")
 # best one measured makes it a climb.
 BEST = Path("data/nets/loop_best.npz")
 BEST_SCORE = Path("data/nets/loop_best.txt")
-# How many games it took to fill the last training window. Persisted so a restart resumes the
-# volume the machine was already calibrated to instead of finding it again from scratch.
-GAMES_STATE = Path("data/nets/loop_games.txt")
 LOG = Path("data/loop_log.txt")
 
-# Self-play is the only thing keeping the cpu busy, so it has to last the whole round rather
-# than just the training stage: when it stopped early the machine sat at 3% for a quarter of an
-# hour with seventy of seventy-two cores idle. The outcomes file is flushed after every game,
-# so its mtime is when self-play actually ended, and the ratio of that to the round it was meant
-# to cover is the exact correction. Damped a little because a round's length varies with whether
-# it ran a confirmation match, and bounded so one strange round cannot run away with it.
-GAMES_DAMPING = 0.7
-GAMES_MAX_STEP = 3.0
-GAMES_FLOOR = 400
-GAMES_CEILING = 200_000
+# Self-play is the only thing keeping the cpu busy, and any fixed batch is the wrong shape for
+# that: too small and the machine idles for the rest of the round, too large and the next round
+# blocks waiting for it. So the games do not come in batches at all. One run is started and left
+# going, and the round takes whatever it has produced when it comes round again. The count is a
+# ceiling it is never meant to reach.
+SELFPLAY_GAMES = 10_000_000
+SELFPLAY_LOG = Path("data/loop_selfplay.txt")
+_SELFPLAY_HANDLE = None
 
 
 def run(
@@ -162,14 +157,14 @@ def build_candidate(source: Path, net: Path) -> None:
     shutil.copy(net, CANDIDATE / "weights" / "net.npz")
 
 
-def read_games(fallback: int) -> int:
-    """The game count the machine was last calibrated to, or the starting guess."""
-    if not GAMES_STATE.is_file():
-        return fallback
-    try:
-        return max(GAMES_FLOOR, min(GAMES_CEILING, int(float(GAMES_STATE.read_text().strip()))))
-    except ValueError:
-        return fallback
+def selfplay_log():
+    """One append handle, reused. Opening a fresh one every round would leak a file handle a
+    round, and a run meant to last for days would eventually run out of them."""
+    global _SELFPLAY_HANDLE
+    if _SELFPLAY_HANDLE is None:
+        SELFPLAY_LOG.parent.mkdir(parents=True, exist_ok=True)
+        _SELFPLAY_HANDLE = SELFPLAY_LOG.open("a", encoding="utf-8")
+    return _SELFPLAY_HANDLE
 
 
 def launch_selfplay(arguments: argparse.Namespace, player: Path, games: int) -> subprocess.Popen:
@@ -197,7 +192,7 @@ def launch_selfplay(arguments: argparse.Namespace, player: Path, games: int) -> 
             "--base-ms", str(arguments.play_base_ms),
             "--increment-ms", str(arguments.play_base_ms // 100),
         ],
-        stdout=subprocess.PIPE,
+        stdout=selfplay_log(),
         stderr=subprocess.STDOUT,
         text=True,
     )
@@ -320,10 +315,8 @@ def main() -> None:
     prepare_champion(arguments.hidden)
     # Games for the next round, generated while this one trains and plays its match.
     pending: subprocess.Popen | None = None
-    games = read_games(arguments.games)
-    # Only read after a round that launched games, but a round can end early enough not to.
-    launched_at = time.time()
-    note(f"loop starting: {arguments.rounds} rounds, {games} games a round to begin with")
+    games = SELFPLAY_GAMES
+    note(f"loop starting: {arguments.rounds} rounds, self-play running continuously")
 
     for round_number in range(1, arguments.rounds + 1):
         try:
@@ -332,22 +325,18 @@ def main() -> None:
             # that game finished. This is the part that makes it self-play rather than distillation:
             # the training signal comes from what actually won, not only from what Stockfish thinks.
             player = arguments.play_agent or CHAMPION
-            if pending is None:
-                note(f"round {round_number}: the champion plays {games} games")
-                pending = launch_selfplay(arguments, player, games)
-            else:
-                note(f"round {round_number}: collecting the games played during training")
-            try:
-                pending.communicate(timeout=arguments.stage_limit)
-                code = pending.returncode
-            except subprocess.TimeoutExpired:
+            # The games have been running since the last round started. Stop them, take what
+            # they made, and start the next lot immediately, so the only gap is the moment it
+            # takes to do that rather than however much of the round was left over.
+            if pending is not None:
+                note(f"round {round_number}: taking the games played since the last round")
                 kill_tree(pending.pid)
-                pending.communicate()
-                code = 1
-            pending = None
-            if code != 0 or not POOL.is_file():
-                note(f"round {round_number}: self-play failed, skipping round")
+                pending.wait()
+                pending = None
+            if not POOL.is_file():
+                note(f"round {round_number}: no games on disk yet, skipping round")
                 continue
+            pending = launch_selfplay(arguments, player, games)
             played = sum(1 for _ in OUTCOMES.open(encoding="utf-8"))
             note(f"round {round_number}: {played:,} positions from games played so far")
 
@@ -372,9 +361,7 @@ def main() -> None:
 
             # The CPU is idle for the whole of training and the match. Start the next round's
             # games now rather than after, and the two run together.
-            pending = launch_selfplay(arguments, player, games)
-            launched_at = time.time()
-            note(f"round {round_number}: training while the next round's games are played")
+            note(f"round {round_number}: training while the games keep playing")
             code, output = run(
                 [
                     "tools.nnue",
@@ -478,26 +465,11 @@ def main() -> None:
             else:
                 note(f"round {round_number}: rejected, champion unchanged")
 
-            # How long the games actually lasted against the round they had to cover. Still
-            # running means they covered it, and the ratio is one. Finished early means the
-            # cpu was idle from that moment, and the ratio says by exactly how much.
-            round_seconds = time.monotonic() - started
-            if pending is not None and pending.poll() is not None and OUTCOMES.is_file():
-                played_for = max(1.0, OUTCOMES.stat().st_mtime - launched_at)
-                ratio = min(GAMES_MAX_STEP, max(1.0, round_seconds / played_for))
-                scaled = games * (1.0 + (ratio - 1.0) * GAMES_DAMPING)
-                games = max(GAMES_FLOOR, min(GAMES_CEILING, round(scaled)))
-                idle = round_seconds - played_for
-                note(
-                    f"round {round_number}: games ran {played_for / 60:.1f} min of a "
-                    f"{round_seconds / 60:.1f} min round, {idle / 60:.1f} min idle, "
-                    f"next round plays {games}"
-                )
-                GAMES_STATE.write_text(f"{games}" + chr(10), encoding="utf-8")
-            else:
-                note(f"round {round_number}: games covered the whole round, holding at {games}")
-
-            note(f"round {round_number}: done in {round_seconds / 60:.1f} min")
+            alive = pending is not None and pending.poll() is None
+            note(
+                f"round {round_number}: done in {(time.monotonic() - started) / 60:.1f} min"
+                f"{'' if alive else ', games are not running'}"
+            )
         # Any escape here would end a run meant to last until somebody stops it. A round
         # that dies for its own reasons should cost that round, not the night.
         except Exception as failure:
