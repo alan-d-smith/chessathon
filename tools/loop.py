@@ -225,25 +225,17 @@ def launch_selfplay(arguments: argparse.Namespace, player: Path, games: int) -> 
     )
 
 
-def keep_playing(
-    pending: subprocess.Popen | None,
-    arguments: argparse.Namespace,
-    player: Path,
-    games: int,
-    round_number: int,
-) -> subprocess.Popen:
-    """Restart the games if they have stopped, and say so.
+def pause_playing(pending: subprocess.Popen | None, round_number: int) -> None:
+    """Stop the games so the next stage gets the machine to itself.
 
-    Self-play is the only thing on the cpu while the gpu trains, so when it dies the machine
-    goes quiet until the next round notices -- eight minutes of seventy-two idle cores, the
-    first time it happened. A round is long, so this is checked at every stage boundary rather
-    than only at the start of one.
+    Self-play belongs beside training, which holds the gpu and leaves the cpu idle. Beside
+    labelling or a match it is not pipelining, it is two full pools on one box: fifty-six
+    workers each on seventy-two cores, which is the oversubscription every crash so far has
+    come out of. Every stage gets the whole machine in turn instead.
     """
     if pending is not None and pending.poll() is None:
-        return pending
-    if pending is not None:
-        note(f"round {round_number}: the games had stopped, starting them again")
-    return launch_selfplay(arguments, player, games)
+        kill_tree(pending.pid)
+        pending.wait()
 
 
 def kill_leftovers() -> None:
@@ -388,6 +380,8 @@ def main() -> None:
             played = sum(1 for _ in OUTCOMES.open(encoding="utf-8"))
             note(f"round {round_number}: {played:,} positions from games played so far")
 
+            pause_playing(pending, round_number)
+            pending = None
             note(f"round {round_number}: labelling")
             # Appends and skips what it already has, so the pool grows across rounds.
             code, _ = run(
@@ -413,7 +407,7 @@ def main() -> None:
 
             # The CPU is idle for the whole of training and the match. Start the next round's
             # games now rather than after, and the two run together.
-            pending = keep_playing(pending, arguments, player, games, round_number)
+            pending = launch_selfplay(arguments, player, games)
             note(f"round {round_number}: training while the games keep playing")
             code, output = run(
                 [
@@ -441,7 +435,8 @@ def main() -> None:
             note(f"round {round_number}: {holdout[-1].strip() if holdout else 'trained'}")
 
 
-            pending = keep_playing(pending, arguments, player, games, round_number)
+            pause_playing(pending, round_number)
+            pending = None
             note(f"round {round_number}: playing the champion")
             build_candidate(CHAMPION, NET)
             code, output = run(
@@ -480,7 +475,6 @@ def main() -> None:
                 # suite the candidate has never been measured on has to agree before the
                 # champion changes, so a win has to be a property of the network rather than
                 # of three hundred openings.
-                pending = keep_playing(pending, arguments, player, games, round_number)
                 note(f"round {round_number}: confirming on a suite it has not played")
                 code, output = run(
                     [
