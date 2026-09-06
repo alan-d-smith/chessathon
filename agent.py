@@ -496,6 +496,64 @@ def load_net() -> bool:
         return False
 
 
+# Endgame tablebases, if any shipped. AGENTS.md allows them: a tablebase is solved ground truth
+# rather than an engine's opinion. Only the three and four man tables are here, which is 4MB of
+# the 50MB the zip may hold; five man is 279MB and does not fit. That band is small but it is
+# exactly where the search was failing, because a piece square evaluation has nothing to say
+# about driving a bare king to the edge: king and rook against king was being shuffled into a
+# threefold repetition, and so were two bishops.
+TB_MEN: Final = 4
+# Typed loosely on purpose: naming chess.syzygy here would import it at module scope, and it
+# is only ever needed by a game that reaches four men.
+tablebase: Any = None
+
+
+def load_tablebase() -> Any:
+    """Open the shipped tables, or return None and play on the search alone."""
+    path = Path(__file__).resolve().parent / "weights" / "syzygy"
+    if not path.is_dir():
+        return None
+    try:
+        import chess.syzygy
+
+        return chess.syzygy.open_tablebase(str(path))
+    except Exception:
+        return None
+
+
+def tablebase_move(board: chess.Board) -> chess.Move | None:
+    """The move the tables say is best, or None when they cannot answer.
+
+    Winning is not enough on its own: every move that keeps a won position looks equally won to
+    a win/draw/loss probe, which is how a won ending gets shuffled. Distance to zero is what
+    orders them, so the move chosen is the one that actually makes progress towards the pawn
+    move or capture that resets the fifty move count, and from there to mate.
+    """
+    best: chess.Move | None = None
+    best_key: tuple[int, int] | None = None
+    for move in board.legal_moves:
+        board.push(move)
+        try:
+            if board.is_checkmate():
+                board.pop()
+                return move
+            # Both probes are from the side to move, which after our move is the opponent, so
+            # both are negated to read as ours.
+            outcome = -tablebase.probe_wdl(board)
+            distance = -tablebase.probe_dtz(board)
+        except Exception:
+            board.pop()
+            return None
+        board.pop()
+        # Win first. Then, when winning, the shortest distance to zero; when losing, the
+        # longest, because the fifty move rule is the only thing that can still save us.
+        progress = -abs(distance) if outcome > 0 else abs(distance)
+        key = (outcome, progress)
+        if best_key is None or key > best_key:
+            best, best_key = move, key
+    return best
+
+
 def evaluate_net(board: chess.Board) -> int:
     """The network's view, in centipawns from the side to move."""
     np = net_state["numpy"]
@@ -535,6 +593,7 @@ def evaluate_residual(board: chess.Board) -> int:
     return evaluate_tables(board) + evaluate_net(board)
 
 
+tablebase = load_tablebase()
 USING_NET: Final = load_net()
 
 if USING_NET:
@@ -828,6 +887,18 @@ def get_move(fen: str, time_left_ms: int) -> str:
     choice = legal[0]
     settled: chess.Move | None = None
     previous_score = -INFINITY
+
+    # A position the tables cover is already solved, and a search can only be wrong about it.
+    # Costs one popcount on every other move, which is nothing.
+    if tablebase is not None and chess.popcount(board.occupied) <= TB_MEN:
+        answer = tablebase_move(board)
+        if answer is not None:
+            board.push(answer)
+            seen.add(board._transposition_key())
+            board.pop()
+            last_clock_ms = float(time_left_ms)
+            last_spent_ms = (time.monotonic() - started) * 1000.0
+            return answer.uci()
 
     for depth in range(1, MAX_DEPTH + 1):
         best_move: chess.Move | None = None
