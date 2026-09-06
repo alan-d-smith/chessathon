@@ -16,6 +16,8 @@ import cProfile
 import importlib
 import pstats
 import time
+
+import chess
 from types import ModuleType
 
 POSITIONS: tuple[tuple[str, str], ...] = (
@@ -36,8 +38,9 @@ def run(agent: ModuleType, budget_ms: int) -> None:
     total_nodes = 0
     total_seconds = 0.0
     for label, fen in POSITIONS:
-        # The agent budgets a share of the clock, so hand it a clock that yields the budget.
-        clock = budget_ms * agent.EXPECTED_MOVES
+        # The agent budgets a share of the clock over the moves it expects to still play,
+        # so the clock that yields a given budget depends on how far in the position is.
+        clock = budget_ms * agent.remaining_moves(chess.Board(fen).fullmove_number)
         agent.transposition.clear()
         agent.seen.clear()
         # The agent infers the increment from how the clock moves between its turns. A bench

@@ -33,9 +33,19 @@ CHECK_INTERVAL: Final = 512
 # Wall time is what the referee measures, so the budget leaves room for the round trip and the
 # search checks the clock mid-flight rather than only between depths.
 MOVE_OVERHEAD_MS: Final = 150
-EXPECTED_MOVES: Final = 30
+# A fixed thirtieth of what is left never reaches zero: it spends four seconds on move ten,
+# where the position is nearly book, and under one on move eighty, where the game is being
+# decided. Three rated losses ended in mate with a quarter of the clock still unspent. The FEN
+# carries the move number, so the divisor can be what is plausibly left to play instead.
+EXPECTED_TOTAL_MOVES: Final = 56
+MIN_REMAINING_MOVES: Final = 18
 MAX_CLOCK_FRACTION: Final = 0.35
 INCREMENT_SHARE: Final = 0.75
+# A root move still changing at the deepest finished iteration is worth more than one that
+# settled at depth six. The extension is a multiple of the ordinary budget and the fraction
+# above still caps it, so it can never reach for a share of the clock we cannot afford.
+EXTENSION_FACTOR: Final = 2.5
+INSTABILITY_CP: Final = 40
 ASSUMED_INCREMENT_MS: Final = 500
 # Twice the published increment. The inferred value feeds a budget whose spend feeds the next
 # inference, so it needs a ceiling that a feedback loop cannot climb past.
@@ -735,16 +745,28 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int, ply: int) -> 
     return best_score
 
 
-def budget_s(time_left_ms: int) -> float:
-    """Spend a share of the clock, never a fixed amount, and never most of what is left.
+def remaining_moves(move_number: int) -> int:
+    """How many more moves to plan for, given how far into the game we already are.
+
+    A game already forty moves old will not last another thirty. The floor matters more than
+    the slope: it is what stops a long endgame being played at a tenth of a second a move, and
+    because the spend stays a fraction of what is left, the clock asymptotes rather than runs
+    out. At this floor it settles around two seconds remaining, spending the increment.
+    """
+    return max(MIN_REMAINING_MOVES, EXPECTED_TOTAL_MOVES - move_number)
+
+
+def budget_s(time_left_ms: int, move_number: int) -> tuple[float, float]:
+    """What to spend on this move, and the most an unsettled search may extend to.
 
     The increment is worth spending because it comes back every move, but the contract never
     states it, so it is measured rather than assumed: guessing 0.5s at a time control that pays
     0.1s spends five times the increment every move and walks the clock down to a flag.
     """
     usable = max(0.0, time_left_ms - MOVE_OVERHEAD_MS)
-    share = usable / EXPECTED_MOVES + increment_ms * INCREMENT_SHARE
-    return min(share, usable * MAX_CLOCK_FRACTION) / 1000.0
+    share = usable / remaining_moves(move_number) + increment_ms * INCREMENT_SHARE
+    ceiling = usable * MAX_CLOCK_FRACTION
+    return min(share, ceiling) / 1000.0, min(share * EXTENSION_FACTOR, ceiling) / 1000.0
 
 
 def get_move(fen: str, time_left_ms: int) -> str:
@@ -775,13 +797,16 @@ def get_move(fen: str, time_left_ms: int) -> str:
     # move can never equal one with them to move. Without the move played below, this check
     # was dead code that had never once fired.
     seen.add(board._transposition_key())
-    deadline = started + budget_s(time_left_ms)
+    soft, hard = budget_s(time_left_ms, board.fullmove_number)
+    deadline = started + soft
     nodes = 0
     reached = 0
 
     # Whatever happens below, this is already legal, so a timeout or a bug in the search costs
     # a weaker move rather than the game.
     choice = legal[0]
+    settled: chess.Move | None = None
+    previous_score = -INFINITY
 
     for depth in range(1, MAX_DEPTH + 1):
         best_move: chess.Move | None = None
@@ -819,6 +844,16 @@ def get_move(fen: str, time_left_ms: int) -> str:
         reached = depth
         if abs(best_score) > MATE - MAX_DEPTH:
             break  # a mate score will not get better with depth
+
+        # A root move that just changed, or a score that just fell, means the last iteration
+        # was wrong about this position and the next one is worth paying for. Moving the
+        # deadline is the whole mechanism: a settled search finds it already behind and the
+        # next iteration stops on its first clock check, costing microseconds.
+        unstable = settled is not None and (
+            best_move != settled or best_score < previous_score - INSTABILITY_CP
+        )
+        settled, previous_score = best_move, best_score
+        deadline = started + (hard if unstable else soft)
 
     # Remember where this move leaves the board, so a later move returning here is recognised.
     board.push(choice)

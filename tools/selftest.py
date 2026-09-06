@@ -67,7 +67,9 @@ def main() -> None:
 
             if chess.Move.from_uci(uci) not in legal:
                 failures.append(f"{label} @ {clock}ms: illegal move {uci}")
-            budget_ms = agent.budget_s(clock) * 1000.0
+            # The ceiling, not the ordinary budget: an unsettled search is allowed to
+            # spend up to it, so that is the number an overrun has to be measured against.
+            budget_ms = agent.budget_s(clock, board.fullmove_number)[1] * 1000.0
             overrun = spent_ms - budget_ms
             slowest = max(slowest, overrun)
             if overrun > OVERRUN_ALLOWANCE_MS:
