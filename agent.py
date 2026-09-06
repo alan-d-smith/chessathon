@@ -41,9 +41,11 @@ EXPECTED_TOTAL_MOVES: Final = 56
 MIN_REMAINING_MOVES: Final = 18
 MAX_CLOCK_FRACTION: Final = 0.35
 INCREMENT_SHARE: Final = 0.75
-# A root move still changing at the deepest finished iteration is worth more than one that
-# settled at depth six. The extension is a multiple of the ordinary budget and the fraction
-# above still caps it, so it can never reach for a share of the clock we cannot afford.
+# A search that has just discovered the position is worse than it thought is worth paying
+# more for, because that is where another iteration can still find something. A root move that
+# merely changed is not the same signal: in round 40 that fired on 31% of moves, spent 78
+# seconds on the first 25 and left 68 for the next 47, and four of six blunders came in the
+# starved tail. So the trigger is the score falling, not the move moving.
 EXTENSION_FACTOR: Final = 2.5
 INSTABILITY_CP: Final = 40
 ASSUMED_INCREMENT_MS: Final = 500
@@ -223,6 +225,7 @@ seen: set[Hashable] = set()
 nodes = 0
 deadline = 0.0
 reached = 0  # deepest iteration completed on the last move, for diagnostics
+extensions = 0  # how many iterations asked for more time, counted across the game
 
 # The increment is inferred from how the clock moves between our own turns, starting from the
 # published 0.5s and correcting itself after one move at whatever the real time control is.
@@ -855,7 +858,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
     fen           the position to move in; your colour is the side to move
     time_left_ms  your clock before this move, in milliseconds
     """
-    global deadline, nodes, reached, increment_ms, last_clock_ms, last_spent_ms
+    global deadline, nodes, reached, increment_ms, last_clock_ms, last_spent_ms, extensions
 
     board = chess.Board(fen)
     legal = list(board.legal_moves)
@@ -937,14 +940,14 @@ def get_move(fen: str, time_left_ms: int) -> str:
         if abs(best_score) > MATE - MAX_DEPTH:
             break  # a mate score will not get better with depth
 
-        # A root move that just changed, or a score that just fell, means the last iteration
-        # was wrong about this position and the next one is worth paying for. Moving the
-        # deadline is the whole mechanism: a settled search finds it already behind and the
-        # next iteration stops on its first clock check, costing microseconds.
-        unstable = settled is not None and (
-            best_move != settled or best_score < previous_score - INSTABILITY_CP
-        )
+        # A score that just fell means the last iteration was wrong about this position and
+        # the next one is worth paying for. Moving the deadline is the whole mechanism: a
+        # settled search finds it already behind and the next iteration stops on its first
+        # clock check, costing microseconds.
+        unstable = settled is not None and best_score < previous_score - INSTABILITY_CP
         settled, previous_score = best_move, best_score
+        if unstable:
+            extensions += 1
         deadline = started + (hard if unstable else soft)
 
     # Remember where this move leaves the board, so a later move returning here is recognised.
