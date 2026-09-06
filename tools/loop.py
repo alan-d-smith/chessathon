@@ -50,7 +50,17 @@ NET = Path("data/nets/loop_net.npz")
 # best one measured makes it a climb.
 BEST = Path("data/nets/loop_best.npz")
 BEST_SCORE = Path("data/nets/loop_best.txt")
+# How many games it took to fill the last training window. Persisted so a restart resumes the
+# volume the machine was already calibrated to instead of finding it again from scratch.
+GAMES_STATE = Path("data/nets/loop_games.txt")
 LOG = Path("data/loop_log.txt")
+
+# How far the game count moves when a round says it was wrong. A round is the only measurement
+# available, so this trades how fast the volume converges against how far it overshoots once
+# it is there: at a fifth, it settles within about one round of the right number.
+GAMES_STEP = 1.2
+GAMES_FLOOR = 400
+GAMES_CEILING = 40_000
 
 
 def run(
@@ -148,21 +158,33 @@ def build_candidate(source: Path, net: Path) -> None:
     shutil.copy(net, CANDIDATE / "weights" / "net.npz")
 
 
-def launch_selfplay(arguments: argparse.Namespace, player: Path) -> subprocess.Popen:
+def read_games(fallback: int) -> int:
+    """The game count the machine was last calibrated to, or the starting guess."""
+    if not GAMES_STATE.is_file():
+        return fallback
+    try:
+        return max(GAMES_FLOOR, min(GAMES_CEILING, int(float(GAMES_STATE.read_text().strip()))))
+    except ValueError:
+        return fallback
+
+
+def launch_selfplay(arguments: argparse.Namespace, player: Path, games: int) -> subprocess.Popen:
     """Start a round of self-play in the background and return without waiting.
 
-    Training runs on the GPU for a third of every round, and the CPU has nothing to do for all
-    of it. Generating the next round's games during that window costs nothing and recovers the
-    time. The games come from the champion as it stands when they start, which is how an actor
-    and a learner normally run: the actor plays with the latest weights it has while the learner
-    fits the next ones.
+    Training runs on the GPU and the CPU has nothing to do for all of it, so the next round's
+    games are generated in that window. The games come from the champion as it stands when they
+    start, which is how an actor and a learner normally run: the actor plays with the latest
+    weights it has while the learner fits the next ones.
+
+    How many games that window holds is a property of the machine, the clock and the worker
+    count rather than something worth guessing, so the caller measures it round by round.
     """
     return subprocess.Popen(
         [
             sys.executable, "-m", "tools.selfplay",
             "--white", str(player),
             "--black", str(player),
-            "--games", str(arguments.games),
+            "--games", str(games),
             "--workers", str(arguments.workers),
             "--openings", str(arguments.openings),
             "--out", str(OUTCOMES),
@@ -190,7 +212,15 @@ def kill_leftovers() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the improvement loop until stopped.")
     parser.add_argument("--rounds", type=int, default=100)
-    parser.add_argument("--games", type=int, default=3000, help="self-play games a round")
+    parser.add_argument(
+        "--games",
+        type=int,
+        default=3400,
+        help=(
+            "self-play games in the first round. After that the loop sets its own volume from "
+            "whether the games outlasted training, so this is only a starting point"
+        ),
+    )
     parser.add_argument("--nodes", type=int, default=50_000, help="labelling depth")
     # 64 is what the shipped network uses. A mismatch here silently declines the warm
     # start, because the stored weights cannot be loaded into a different shape, and
@@ -282,7 +312,8 @@ def main() -> None:
     prepare_champion(arguments.hidden)
     # Games for the next round, generated while this one trains and plays its match.
     pending: subprocess.Popen | None = None
-    note(f"loop starting: {arguments.rounds} rounds, {arguments.games} games a round")
+    games = read_games(arguments.games)
+    note(f"loop starting: {arguments.rounds} rounds, {games} games a round to begin with")
 
     for round_number in range(1, arguments.rounds + 1):
         try:
@@ -292,8 +323,8 @@ def main() -> None:
             # the training signal comes from what actually won, not only from what Stockfish thinks.
             player = arguments.play_agent or CHAMPION
             if pending is None:
-                note(f"round {round_number}: the champion plays {arguments.games} games")
-                pending = launch_selfplay(arguments, player)
+                note(f"round {round_number}: the champion plays {games} games")
+                pending = launch_selfplay(arguments, player, games)
             else:
                 note(f"round {round_number}: collecting the games played during training")
             try:
@@ -331,7 +362,7 @@ def main() -> None:
 
             # The CPU is idle for the whole of training and the match. Start the next round's
             # games now rather than after, and the two run together.
-            pending = launch_selfplay(arguments, player)
+            pending = launch_selfplay(arguments, player, games)
             note(f"round {round_number}: training while the next round's games are played")
             code, output = run(
                 [
@@ -357,6 +388,23 @@ def main() -> None:
                 continue
             holdout = [line for line in output.splitlines() if "best holdout" in line]
             note(f"round {round_number}: {holdout[-1].strip() if holdout else 'trained'}")
+
+            # Self-play holds the CPU while training holds the GPU, and the only thing that
+            # matters is whether it lasted as long as training did. Finishing early leaves the
+            # machine idle for the rest of the window, which was costing a third of every
+            # round; still running when the match starts stacks a match pool on top of a
+            # self-play pool, which is what deadlocked this loop once already. Polling here is
+            # that measurement, taken at the one boundary where the answer is actionable, and
+            # the volume for the next round follows it. Held on a failed round, where the
+            # window was cut short and the signal would say nothing about the machine.
+            if pending is not None:
+                if pending.poll() is None:
+                    games = max(GAMES_FLOOR, round(games / GAMES_STEP))
+                    note(f"round {round_number}: games outlasted training, next round plays {games}")
+                else:
+                    games = min(GAMES_CEILING, round(games * GAMES_STEP))
+                    note(f"round {round_number}: idle cpu left in training, next round plays {games}")
+                GAMES_STATE.write_text(f"{games}" + chr(10), encoding="utf-8")
 
             note(f"round {round_number}: playing the champion")
             build_candidate(CHAMPION, NET)
