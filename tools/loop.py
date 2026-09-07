@@ -39,6 +39,10 @@ import time
 from contextlib import suppress
 from pathlib import Path
 
+import numpy
+
+from tools.widen import widen
+
 CHAMPION = Path("baselines/champion")
 CANDIDATE = Path("data/candidate")
 POOL = Path("data/loop_positions.txt")
@@ -50,6 +54,8 @@ NET = Path("data/nets/loop_net.npz")
 # best one measured makes it a climb.
 BEST = Path("data/nets/loop_best.npz")
 BEST_SCORE = Path("data/nets/loop_best.txt")
+# Where a widened copy of the best net goes when the width being trained has changed.
+WIDE = Path("data/nets/loop_best_wide.npz")
 LOG = Path("data/loop_log.txt")
 
 # Self-play is the only thing keeping the cpu busy, and any fixed batch is the wrong shape for
@@ -159,6 +165,29 @@ def read_best() -> float:
         return float(BEST_SCORE.read_text(encoding="utf-8").strip())
     except ValueError:
         return float("-inf")
+
+
+def warm_start(hidden: int) -> Path | None:
+    """The network to build on, widened if the width being trained has changed.
+
+    nnue.py ignores a warm start whose width does not match and does not say so, which made
+    asking the loop for a wider network mean starting from noise and spending the run recovering
+    ground the net we already had was standing on. Widening is exact -- every hidden unit is
+    duplicated and contributes proportionally less -- so the wider net starts at the narrower
+    one's quality and training pulls the copies apart from there.
+    """
+    if not BEST.is_file():
+        return None
+    with numpy.load(BEST) as data:
+        stored = int(data["hidden_bias"].shape[0])
+    if stored == hidden:
+        return BEST
+    if hidden % stored:
+        note(f"warm start skipped: {stored} units do not divide into {hidden}")
+        return None
+    widen(BEST, WIDE, hidden, noise=0.02, seed=0)
+    note(f"warm start widened from {stored} to {hidden} units")
+    return WIDE
 
 
 def check_tables() -> None:
@@ -332,12 +361,13 @@ def main() -> None:
     parser.add_argument(
         "--play-base-ms",
         type=int,
-        default=8000,
+        default=30000,
         help=(
-            "clock for the self-play games. A network agent spends about 1.7s importing "
-            "numba per process and self-play starts two processes a game, so short games "
-            "leave the machine in startup rather than searching. Longer games amortise "
-            "that and are played better, which is what the training wants."
+            "clock for the self-play games. The agent compiles its evaluation and move "
+            "generator at import and takes about 5.8s to start, and self-play starts two "
+            "processes a game, so short games leave the machine in startup rather than "
+            "searching. Longer games amortise that and are played better, which is what "
+            "the training wants."
         ),
     )
     parser.add_argument(
@@ -435,6 +465,7 @@ def main() -> None:
             # The CPU is idle for the whole of training and the match. Start the next round's
             # games now rather than after, and the two run together.
             pending = launch_selfplay(arguments, player, games)
+            warm = warm_start(arguments.hidden)
             note(f"round {round_number}: training while the games keep playing")
             code, output = run(
                 [
@@ -449,7 +480,7 @@ def main() -> None:
                     "--outcomes", str(OUTCOMES),
                     "--outcome-weight", str(arguments.outcome_weight),
                     *(["--residual"] if arguments.residual else []),
-                    *(["--warm", str(BEST)] if BEST.is_file() else []),
+                    *(["--warm", str(warm)] if warm is not None else []),
                 ],
                 quiet=True,
                 python=arguments.train_python,
