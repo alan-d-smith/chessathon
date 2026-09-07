@@ -10,6 +10,7 @@ first, so most of the code below is about move ordering; and a flag is a whole p
 search abandons a depth rather than finish it, and get_move always has a legal move in hand.
 """
 
+import os
 import time
 from collections import Counter
 from collections.abc import Hashable, Iterator
@@ -30,6 +31,9 @@ MAX_DEPTH: Final = 64
 # overruns its budget. 512 nodes costs a few microseconds a second and bounds the overrun to
 # milliseconds; at 2048 a slow search can sail a quarter of a second past the deadline.
 CHECK_INTERVAL: Final = 512
+# Search a fixed number of nodes instead of a slice of the clock. Only ever set by the tools
+# that compare versions, where a time bound would decide the answer before the change did.
+NODE_BUDGET: Final = int(os.environ.get("AGENT_NODE_BUDGET", "0"))
 
 # Wall time is what the referee measures, so the budget leaves room for the round trip and the
 # search checks the clock mid-flight rather than only between depths.
@@ -242,9 +246,20 @@ last_spent_ms = 0.0
 
 
 def tick() -> None:
-    """Give up on the clock inside the search, not only between depths."""
+    """Give up on the clock inside the search, not only between depths.
+
+    A node budget replaces the clock entirely when one is set, which makes the search
+    reproducible: the same position gives the same move every time, on any machine. Nothing
+    sets it in a real game, so the shipped behaviour is the clock exactly as before. It exists
+    because a time bound makes every comparison noisy -- the same position at the same clock
+    was found to reach depth 5 once and depth 6 the next time, and play a different move.
+    """
     global nodes
     nodes += 1
+    if NODE_BUDGET:
+        if nodes >= NODE_BUDGET:
+            raise Timeout
+        return
     if nodes % CHECK_INTERVAL == 0 and time.monotonic() > deadline:
         raise Timeout
 
