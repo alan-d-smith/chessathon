@@ -399,7 +399,7 @@ def evaluate_tables(board: chess.Board) -> int:
     return score if board.turn == chess.WHITE else -score
 
 
-def load_fast_tables() -> bool:
+def load_fast_tables(cached: bool = True) -> bool:
     """Compile evaluate_tables, and adopt it only if it agrees with the python it replaces.
 
     The tables are the largest thing left in an evaluation and every line of them is integer
@@ -431,7 +431,7 @@ def load_fast_tables() -> bool:
     geometry = np.array([FILE_OF, RANK_OF, scan_table], dtype=np.int64)
     magic = np.uint64(0x03F79D71B4CB0A89)
 
-    @njit(cache=True)
+    @njit(cache=cached)
     def count_bits(mask):  # type: ignore[no-untyped-def]
         """Population count. Every constant is uint64: mixing widths here silently gives floats."""
         mask = mask - ((mask >> np.uint64(1)) & np.uint64(0x5555555555555555))
@@ -450,7 +450,7 @@ def load_fast_tables() -> bool:
         " uint64[:, :, ::1], uint64)"
     )
 
-    @njit(signature, cache=True)
+    @njit(signature, cache=cached)
     def scored(  # type: ignore[no-untyped-def]
         pawns, knights, bishops, rooks, queens, kings, white, black, white_to_move,
         placement, structural, geometry, files, zones, magic,
@@ -589,7 +589,7 @@ def load_fast_tables() -> bool:
 
 # Kept so the jitted tables can always be checked against the python they replaced.
 evaluate_tables_python = evaluate_tables
-USING_FAST_TABLES: Final = load_fast_tables()
+USING_FAST_TABLES: Final = load_fast_tables() or load_fast_tables(cached=False)
 
 # What the search calls. Rebound below if a network ships, either to replace this or to
 # correct it; the search itself never needs to know which.
@@ -1113,7 +1113,7 @@ MOVEGEN_PROBES: Final = (
 )
 
 
-def load_fast_moves() -> bool:
+def load_fast_moves(cached: bool = True) -> bool:
     """Compile a move generator that reproduces python-chess move for move, or keep python-chess.
 
     Move generation is the largest thing left in the search by a distance, and python-chess does
@@ -1181,11 +1181,11 @@ def load_fast_moves() -> bool:
         dtype=np.int64,
     )
 
-    @njit(cache=True, inline="always")
+    @njit(cache=cached, inline="always")
     def lowest_bit(mask, scan):  # type: ignore[no-untyped-def]
         return scan[((mask & (~mask + one)) * magic) >> shift]
 
-    @njit(cache=True, inline="always")
+    @njit(cache=cached, inline="always")
     def highest_bit(mask, scan):  # type: ignore[no-untyped-def]
         """Smear every bit below the top one down, then isolate it."""
         mask |= mask >> np.uint64(1)
@@ -1196,7 +1196,7 @@ def load_fast_moves() -> bool:
         mask |= mask >> np.uint64(32)
         return scan[((mask ^ (mask >> np.uint64(1))) * magic) >> shift]
 
-    @njit(cache=True)
+    @njit(cache=cached)
     def slide(square, occupied, dirs, scan):  # type: ignore[no-untyped-def]
         """Classical ray attacks: run each direction out to its first blocker, inclusive."""
         attacks = np.uint64(0)
@@ -1214,7 +1214,7 @@ def load_fast_moves() -> bool:
             attacks |= ray
         return attacks
 
-    @njit(cache=True)
+    @njit(cache=cached)
     def attackers(  # type: ignore[no-untyped-def]
         by_white, square, occupied, pawns, knights, bishops, rooks, queens, kings, white, black,
         knight_t, king_t, pawn_t, rook_rays, bishop_rays, scan,
@@ -1231,7 +1231,7 @@ def load_fast_moves() -> bool:
         )
         return found & (white if by_white else black)
 
-    @njit(cache=True)
+    @njit(cache=cached)
     def piece_attacks(  # type: ignore[no-untyped-def]
         square, bb, occupied, pawns, knights, bishops, rooks, queens, kings, white,
         knight_t, king_t, pawn_t, rook_rays, bishop_rays, scan,
@@ -1256,7 +1256,7 @@ def load_fast_moves() -> bool:
         " uint64[:, :, ::1], uint64[:, :, ::1], int64[::1])"
     )
 
-    @njit(generate_types, cache=True)
+    @njit(generate_types, cache=cached)
     def generate(  # type: ignore[no-untyped-def]
         pawns, knights, bishops, rooks, queens, kings, white, black, occupied,
         white_to_move, clean_castling, to_mask, out,
@@ -1434,7 +1434,7 @@ def load_fast_moves() -> bool:
         " int64[::1], uint64, uint64, uint64, uint64, uint64, uint64)"
     )
 
-    @njit(order_types, cache=True)
+    @njit(order_types, cache=cached)
     def order(  # type: ignore[no-untyped-def]
         out, ranks, count, mode, first, killer0, killer1, history, values,
         pawns, knights, bishops, rooks, queens, theirs,
@@ -1593,7 +1593,7 @@ def ordered_moves(
 fast_generate: Any = None
 fast_order: Any = None
 movegen_state: Any = None
-USING_FAST_MOVES: Final = load_fast_moves()
+USING_FAST_MOVES: Final = load_fast_moves() or load_fast_moves(cached=False)
 def candidates(board: chess.Board, best: chess.Move | None, ply: int) -> Iterator[chess.Move]:
     """The transposition move first, then captures, then the quiet moves that have been cutting.
 
