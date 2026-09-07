@@ -161,6 +161,27 @@ def read_best() -> float:
         return float("-inf")
 
 
+def check_tables() -> None:
+    """Refuse to run if the champion's tables are not the ones training will fit against.
+
+    tools/nnue.py scores the tables through `agent.evaluate_tables`, which imports from the
+    repository root and so reads the root weights.py. The candidate it produces is then built
+    on the champion's weights.py. If those two differ, every round trains a correction for one
+    evaluation and ships it attached to another, and the result is a candidate that loses by
+    sixty elo for a reason nothing in the log mentions. It cost two rounds before it was found.
+    """
+    champion = CHAMPION / "weights.py"
+    root = Path("weights.py")
+    if not champion.is_file() or not root.is_file():
+        return
+    if champion.read_bytes() != root.read_bytes():
+        raise SystemExit(
+            "champion weights.py differs from the repository's, so training would fit a "
+            "correction to one set of tables and ship it with another. Copy one over the "
+            "other before starting."
+        )
+
+
 def prepare_champion(hidden: int) -> None:
     """Seed the champion from whatever is currently shipped, if it does not exist yet."""
     if (CHAMPION / "agent.py").is_file():
@@ -358,6 +379,7 @@ def main() -> None:
             print(f"no interpreter at {candidate}, training on this one instead")
     arguments.train_python = trainer
     prepare_champion(arguments.hidden)
+    check_tables()
     # Games for the next round, generated while this one trains and plays its match.
     pending: subprocess.Popen | None = None
     games = SELFPLAY_GAMES
