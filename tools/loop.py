@@ -293,6 +293,11 @@ def main() -> None:
     # reliable +12 is a test built to say no. elo0 stays at zero, so the guard against
     # promoting a regression is untouched; only the size of win worth having comes down.
     parser.add_argument("--elo1", type=float, default=8.0)
+    # A rate that suits training from noise will kick a converged network out of the minimum it
+    # already sits in. Once the champion is the product of hundreds of epochs, a round is a
+    # refinement and wants a smaller step: at 3e-3 a warm started round came back 69 elo worse
+    # than the champion it started from.
+    parser.add_argument("--rate", type=str, default="5e-4")
     # The matches run beside self-play now, so the two pools share the machine. Sized together
     # rather than each taking four fifths of it, which would be half as many cores again as
     # the box has.
@@ -416,7 +421,7 @@ def main() -> None:
                     "--out", str(NET),
                     "--hidden", str(arguments.hidden),
                     "--epochs", str(epochs),
-                    "--rate", "3e-3",
+                    "--rate", arguments.rate,
                     "--priority", str(arguments.priority),
                     # Both signals: the engine score for precision, the game result for truth.
                     "--outcomes", str(OUTCOMES),
