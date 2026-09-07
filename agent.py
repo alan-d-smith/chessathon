@@ -125,6 +125,9 @@ STRUCTURAL_NAMES: Final = (
     "tempo",
 )
 SHIELD_WANTED: Final = 3
+# Exercises doubled, isolated and passed pawns, open and half open files and a broken
+# shield, so a compiled evaluation that agrees here is not merely agreeing about zeroes.
+SANITY_FEN: Final = "r3k2r/1pp2ppp/p1n5/3Pp3/1P6/P1N2N2/5PPP/R3K2R w KQkq - 0 1"
 
 
 def from_rows(values: list[int]) -> list[int]:
@@ -226,8 +229,10 @@ class Timeout(Exception):
 # Module state survives between the moves of one game and never into the next, which is exactly
 # the lifetime a transposition table wants.
 transposition: dict[Hashable, tuple[int, int, int, chess.Move | None]] = {}
-killers: list[list[chess.Move | None]] = [[None, None] for _ in range(MAX_DEPTH + 2)]
-history: dict[tuple[int, int], int] = {}
+# Killers and history are keyed by move_key rather than by Move: the objects are dataclasses
+# and comparing them is one of the more expensive things the ordering used to do.
+killers: list[list[int]] = [[-1, -1] for _ in range(MAX_DEPTH + 2)]
+history: dict[int, int] = {}
 # Counted, not just remembered. The referee claims the draw on the third occurrence, so
 # the difference between having been somewhere once and twice is the difference between
 # a nudge away from a line and the line being worth exactly nothing.
@@ -382,6 +387,197 @@ def evaluate_tables(board: chess.Board) -> int:
     return score if board.turn == chess.WHITE else -score
 
 
+def load_fast_tables() -> bool:
+    """Compile evaluate_tables, and adopt it only if it agrees with the python it replaces.
+
+    The tables are the largest thing left in an evaluation and every line of them is integer
+    bitboard work, which is exactly what numba is for. Nothing here changes what is computed:
+    the same score comes out, the same search follows from it, and if numba is missing or the
+    compile fails the python below runs unchanged.
+    """
+    global evaluate_tables, evaluate_tables_python
+
+    try:
+        import os
+        import tempfile
+
+        os.environ.setdefault("NUMBA_CACHE_DIR", tempfile.gettempdir())
+        import numpy as np
+        from numba import njit
+    except ImportError:
+        return False
+
+    # Grouped so the call passes a handful of arrays rather than a dozen. Passed, never closed
+    # over: numba freezes a closed-over array into the cached artefact, and weights.py changes.
+    placement = np.array([TABLES_W, TABLES_B], dtype=np.int64)
+    structural = np.array(STRUCTURAL, dtype=np.int64)
+    files = np.array([[chess.BB_FILES[f] for f in range(8)], NEIGHBOUR_FILES], dtype=np.uint64)
+    zones = np.array([PASSED, SHIELD], dtype=np.uint64)
+    scan_table = [0] * 64
+    for square in range(64):
+        scan_table[(((1 << square) * 0x03F79D71B4CB0A89) & 0xFFFFFFFFFFFFFFFF) >> 58] = square
+    geometry = np.array([FILE_OF, RANK_OF, scan_table], dtype=np.int64)
+    magic = np.uint64(0x03F79D71B4CB0A89)
+
+    @njit(cache=True)
+    def count_bits(mask):  # type: ignore[no-untyped-def]
+        """Population count. Every constant is uint64: mixing widths here silently gives floats."""
+        mask = mask - ((mask >> np.uint64(1)) & np.uint64(0x5555555555555555))
+        mask = (mask & np.uint64(0x3333333333333333)) + (
+            (mask >> np.uint64(2)) & np.uint64(0x3333333333333333)
+        )
+        mask = (mask + (mask >> np.uint64(4))) & np.uint64(0x0F0F0F0F0F0F0F0F)
+        return np.int64((mask * np.uint64(0x0101010101010101)) >> np.uint64(56))
+
+    # Spelled out so the dispatcher has nothing to work out per call, and so a python int
+    # is unboxed straight to a uint64 rather than wrapped by hand first. Arrays are declared
+    # C contiguous, which is what np.array gives and what lets numba index them directly.
+    SIGNATURE = (
+        "int64(uint64, uint64, uint64, uint64, uint64, uint64, uint64, uint64, boolean,"
+        " int64[:, :, :, ::1], int64[:, ::1], int64[:, ::1], uint64[:, ::1],"
+        " uint64[:, :, ::1], uint64)"
+    )
+
+    @njit(SIGNATURE, cache=True)
+    def scored(  # type: ignore[no-untyped-def]
+        pawns, knights, bishops, rooks, queens, kings, white, black, white_to_move,
+        placement, structural, geometry, files, zones, magic,
+    ):
+        """evaluate_tables, in integer arithmetic throughout. Positive is good for White."""
+        one = np.uint64(1)
+        shift = np.uint64(58)
+        empty = np.uint64(0)
+        phase = count_bits(knights | bishops) + count_bits(rooks) * 2 + count_bits(queens) * 4
+        if phase > 24:
+            phase = 24
+
+        score = np.int64(0)
+        for piece in range(6):
+            if piece == 0:
+                board = pawns
+            elif piece == 1:
+                board = knights
+            elif piece == 2:
+                board = bishops
+            elif piece == 3:
+                board = rooks
+            elif piece == 4:
+                board = queens
+            else:
+                board = kings
+            for side in range(2):
+                squares = board & (white if side == 0 else black)
+                while squares:
+                    lowest = squares & (~squares + one)
+                    square = geometry[2, (lowest * magic) >> shift]
+                    if side == 0:
+                        score += placement[0, phase, piece, square]
+                    else:
+                        score -= placement[1, phase, piece, square]
+                    squares ^= lowest
+
+        # Doubled, isolated and passed pawns. The python tallies counts and multiplies once at
+        # the end; adding each pawn's own weighted contribution comes to the same integer.
+        for side in range(2):
+            if side == 0:
+                mine = pawns & white
+                theirs = pawns & black
+                sign = np.int64(1)
+                view = 1
+            else:
+                mine = pawns & black
+                theirs = pawns & white
+                sign = np.int64(-1)
+                view = 0
+            for file in range(8):
+                doubled = count_bits(mine & files[0, file])
+                if doubled > 1:
+                    score += sign * (doubled - 1) * structural[phase, 0]
+            remaining = mine
+            while remaining:
+                lowest = remaining & (~remaining + one)
+                square = geometry[2, (lowest * magic) >> shift]
+                remaining ^= lowest
+                if (mine & files[1, geometry[0, square]]) == empty:
+                    score += sign * structural[phase, 1]
+                if (theirs & zones[0, view, square]) == empty:
+                    advance = geometry[1, square] if view == 1 else 7 - geometry[1, square]
+                    if 2 <= advance <= 7:
+                        score += sign * structural[phase, advance]
+
+        if count_bits(bishops & white) >= 2:
+            score += structural[phase, 8]
+        if count_bits(bishops & black) >= 2:
+            score -= structural[phase, 8]
+
+        for side in range(2):
+            if side == 0:
+                mine = white
+                sign = np.int64(1)
+                view = 1
+            else:
+                mine = black
+                sign = np.int64(-1)
+                view = 0
+            remaining = rooks & mine
+            while remaining:
+                lowest = remaining & (~remaining + one)
+                square = geometry[2, (lowest * magic) >> shift]
+                remaining ^= lowest
+                file_mask = files[0, geometry[0, square]]
+                if (pawns & file_mask) == empty:
+                    score += sign * structural[phase, 9]
+                elif (pawns & mine & file_mask) == empty:
+                    score += sign * structural[phase, 10]
+
+            king = kings & mine
+            if king:
+                square = geometry[2, (king * magic) >> shift]
+                present = count_bits(pawns & mine & zones[1, view, square])
+                if present > 3:
+                    present = 3
+                score += sign * (3 - present) * structural[phase, 11]
+
+        score += structural[phase, 12] if white_to_move else -structural[phase, 12]
+        return score if white_to_move else -score
+
+    def fast(board: chess.Board) -> int:
+        """The jitted tables, handed the board's own integers with no conversion in python."""
+        return scored(
+            board.pawns,
+            board.knights,
+            board.bishops,
+            board.rooks,
+            board.queens,
+            board.kings,
+            board.occupied_co[chess.WHITE],
+            board.occupied_co[chess.BLACK],
+            board.turn == chess.WHITE,
+            placement,
+            structural,
+            geometry,
+            files,
+            zones,
+            magic,
+        )
+
+    # Compile, and check it against the python before anything is rebound. A disagreement here
+    # is a compile that went wrong, and the answer to that is to keep the python.
+    try:
+        for probe in (chess.Board(), chess.Board(SANITY_FEN)):
+            if fast(probe) != evaluate_tables(probe):
+                return False
+    except Exception:
+        return False
+    evaluate_tables_python = evaluate_tables
+    evaluate_tables = fast
+    return True
+
+
+# Kept so the jitted tables can always be checked against the python they replaced.
+evaluate_tables_python = evaluate_tables
+USING_FAST_TABLES: Final = load_fast_tables()
+
 # What the search calls. Rebound below if a network ships, either to replace this or to
 # correct it; the search itself never needs to know which.
 evaluate = evaluate_tables
@@ -393,6 +589,20 @@ evaluate = evaluate_tables
 # nothing here can be given a real type at module scope without importing them.
 net_forward: Any = None
 net_state: dict[str, Any] = {}
+
+# The accumulator: the network's hidden layer carried along with the board rather than rebuilt
+# from the pieces at every evaluation. Two of them, one per point of view, because the features
+# are relative to the side to move and every ply swaps which side that is. Indexed by how many
+# moves the board has had pushed onto it, so a level is always written from its parent and can
+# never drift out of step with the board -- and unmaking costs nothing at all, because the
+# parent level is still sitting there untouched.
+ACC_LEVELS: Final = 256
+net_refresh: Any = None
+net_advance: Any = None
+net_readout: Any = None
+# True only inside a search, where every push goes through push_move. Anywhere else an
+# evaluation falls back to the full refresh rather than trust a stack it did not build.
+accumulating = False
 
 
 def load_net() -> bool:
@@ -481,8 +691,75 @@ def load_net() -> bool:
                 total += value * weight_out[unit]
         return total
 
-    global net_forward
+    @njit(cache=True)
+    def refresh(  # type: ignore[no-untyped-def]
+        acc, level, pawns, knights, bishops, rooks, queens, kings, white, black,
+        weight_in, bias_in, lookup, magic,
+    ):
+        """Build one level from the board itself. The only place a level is built from scratch."""
+        for unit in range(acc.shape[2]):
+            acc[level, 0, unit] = bias_in[unit]
+            acc[level, 1, unit] = bias_in[unit]
+        for piece in range(6):
+            if piece == 0:
+                board = pawns
+            elif piece == 1:
+                board = knights
+            elif piece == 2:
+                board = bishops
+            elif piece == 3:
+                board = rooks
+            elif piece == 4:
+                board = queens
+            else:
+                board = kings
+            for colour in range(2):
+                squares = board & (white if colour == 0 else black)
+                while squares:
+                    lowest = squares & (~squares + np.uint64(1))
+                    square = lookup[(lowest * magic) >> np.uint64(58)]
+                    # The same feature seen from both ends: the other side owns it, and the
+                    # board is mirrored so each view has its own first rank at the bottom.
+                    white_feature = colour * 384 + piece * 64 + square
+                    black_feature = (1 - colour) * 384 + piece * 64 + (square ^ 56)
+                    for unit in range(acc.shape[2]):
+                        acc[level, 0, unit] += weight_in[white_feature, unit]
+                        acc[level, 1, unit] += weight_in[black_feature, unit]
+                    squares ^= lowest
+
+    @njit(cache=True)
+    def advance(acc, level, weight_in, packed, count):  # type: ignore[no-untyped-def]
+        """Write the level below from this one, applying only what the move changed."""
+        for unit in range(acc.shape[2]):
+            acc[level + 1, 0, unit] = acc[level, 0, unit]
+            acc[level + 1, 1, unit] = acc[level, 1, unit]
+        for slot in range(count):
+            code = (packed >> (11 * slot)) & 0x7FF
+            sign = 1.0 if (code & 1) == 1 else -1.0
+            square = (code >> 1) & 63
+            piece = (code >> 7) & 7
+            colour = (code >> 10) & 1
+            white_feature = colour * 384 + piece * 64 + square
+            black_feature = (1 - colour) * 384 + piece * 64 + (square ^ 56)
+            for unit in range(acc.shape[2]):
+                acc[level + 1, 0, unit] += sign * weight_in[white_feature, unit]
+                acc[level + 1, 1, unit] += sign * weight_in[black_feature, unit]
+
+    @njit(cache=True)
+    def readout(acc, level, view, weight_out, bias_out):  # type: ignore[no-untyped-def]
+        """The output layer, over a hidden layer that has already been kept up to date."""
+        total = bias_out
+        for unit in range(acc.shape[2]):
+            value = acc[level, view, unit]
+            if value > 0.0:
+                total += value * weight_out[unit]
+        return total
+
+    global net_forward, net_refresh, net_advance, net_readout
     net_forward = forward
+    net_refresh = refresh
+    net_advance = advance
+    net_readout = readout
     net_state.update(
         # A residual net scores the difference from the tables rather than the position, so the
         # two must be added. The flag ships with the weights: reading it from the file means a
@@ -495,6 +772,7 @@ def load_net() -> bool:
         out_b=out_b,
         table=table,
         magic=np.uint64(0x03F79D71B4CB0A89),
+        acc=np.zeros((ACC_LEVELS, 2, hidden_b.shape[0]), dtype=np.float32),
     )
 
     # numba compiles on the first call, not at decoration, so the warm-up below is also where
@@ -504,8 +782,16 @@ def load_net() -> bool:
     # here would be raised at import, which loses every game of the round rather than one move.
     # So the cache is an optimisation that is allowed to fail: compile fresh without it, and
     # failing that, play on the tables alone.
+    def warm() -> None:
+        """Every jitted entry point, once, with the argument types the search will use."""
+        probe = chess.Board()
+        evaluate_net(probe)
+        refresh_accumulator(probe)
+        net_advance(net_state["acc"], 0, net_state["hidden_w"], 0, 0)
+        net_readout(net_state["acc"], 0, 0, net_state["out_w"], net_state["out_b"])
+
     try:
-        evaluate_net(chess.Board())
+        warm()
         return True
     # Whatever the cache did, it must not reach the referee.
     except Exception:
@@ -514,7 +800,10 @@ def load_net() -> bool:
         # The same function compiled in memory. Costs the compile on every process instead of
         # once per machine, which is seconds of the init budget rather than the whole game.
         net_forward = njit(cache=False)(forward.py_func)
-        evaluate_net(chess.Board())
+        net_refresh = njit(cache=False)(refresh.py_func)
+        net_advance = njit(cache=False)(advance.py_func)
+        net_readout = njit(cache=False)(readout.py_func)
+        warm()
         return True
     # The tables are always there.
     except Exception:
@@ -635,6 +924,113 @@ def evaluate_residual(board: chess.Board) -> int:
     return evaluate_tables(board) + evaluate_net(board)
 
 
+def refresh_accumulator(board: chess.Board, level: int = 0) -> None:
+    """Rebuild one level of the accumulator from the board."""
+    np = net_state["numpy"]
+    net_refresh(
+        net_state["acc"],
+        level,
+        np.uint64(board.pawns),
+        np.uint64(board.knights),
+        np.uint64(board.bishops),
+        np.uint64(board.rooks),
+        np.uint64(board.queens),
+        np.uint64(board.kings),
+        np.uint64(board.occupied_co[chess.WHITE]),
+        np.uint64(board.occupied_co[chess.BLACK]),
+        net_state["hidden_w"],
+        net_state["hidden_b"],
+        net_state["table"],
+        net_state["magic"],
+    )
+
+
+def delta(board: chess.Board, move: chess.Move) -> tuple[int, int]:
+    """What a move changes, packed eleven bits per feature: colour, piece, square, and sign.
+
+    One integer rather than an array, so the jitted update takes scalars and allocates nothing
+    per ply. A move changes at most four features -- castling moves two pieces -- which is
+    forty four bits. Read off the move rather than by diffing the board before and after:
+    diffing needs no special cases but costs more than the refresh it is meant to replace.
+    """
+    if not move:
+        return 0, 0  # a null move moves no piece, and both views are kept, so nothing changes
+    piece = board.piece_type_at(move.from_square)
+    if piece is None:
+        return 0, 0  # not a move in this position; the push below will say so
+    piece -= 1
+    mover = 0 if board.turn == chess.WHITE else 1
+    landed = move.promotion - 1 if move.promotion else piece
+    packed = (mover << 10) | (piece << 7) | (move.from_square << 1)
+    packed |= ((mover << 10) | (landed << 7) | (move.to_square << 1) | 1) << 11
+    count = 2
+
+    # Only a king castles and only a pawn takes en passant, so both questions are settled by an
+    # integer compare before anything more expensive is asked. Everything else is a capture
+    # exactly when the square being moved to is occupied, which is one test against occupied.
+    if piece == chess.KING - 1 and board.is_castling(move):
+        # The king is the pair above; the rook is the other half of the same move.
+        home = 0 if board.turn == chess.WHITE else 56
+        kingside = move.to_square > move.from_square
+        rook_from, rook_to = (home + 7, home + 5) if kingside else (home, home + 3)
+        rook = chess.ROOK - 1
+        packed |= ((mover << 10) | (rook << 7) | (rook_from << 1)) << 22
+        packed |= ((mover << 10) | (rook << 7) | (rook_to << 1) | 1) << 33
+        return packed, 4
+
+    if board.occupied & (1 << move.to_square):
+        victim = board.piece_type_at(move.to_square)
+        square = move.to_square
+    elif piece == chess.PAWN - 1 and move.to_square == board.ep_square:
+        # A pawn reaching an empty en passant square can only have got there by taking, and the
+        # pawn it took is not on the square it moved to. It cannot have pushed there: the square
+        # in front of a pawn that has just moved two is the one that pawn came through.
+        victim = chess.PAWN
+        square = move.to_square + (-8 if board.turn == chess.WHITE else 8)
+    else:
+        return packed, count
+    packed |= (((1 - mover) << 10) | ((victim - 1) << 7) | (square << 1)) << 22
+    return packed, 3
+
+
+def push_move(board: chess.Board, move: chess.Move) -> None:
+    """Play a move and carry the accumulator down with it.
+
+    Every push inside a search goes through here. Unmaking needs no counterpart at all: this
+    writes the level below and leaves the current one alone, so board.pop() on its own puts the
+    evaluation back exactly where it was. That is what makes drift impossible rather than
+    merely unlikely -- there is no inverse update to get wrong, and no state to resynchronise.
+    """
+    level = len(board.move_stack)
+    if accumulating and level + 1 < ACC_LEVELS:
+        packed, count = delta(board, move)
+        board.push(move)
+        net_advance(net_state["acc"], level, net_state["hidden_w"], packed, count)
+    else:
+        board.push(move)
+
+
+def evaluate_accumulated(board: chess.Board) -> int:
+    """The network's view, read from the hidden layer the search has been carrying."""
+    level = len(board.move_stack)
+    if not accumulating or level >= ACC_LEVELS:
+        return evaluate_net(board)
+    return int(
+        net_readout(
+            net_state["acc"],
+            level,
+            0 if board.turn == chess.WHITE else 1,
+            net_state["out_w"],
+            net_state["out_b"],
+        )
+    )
+
+
+def evaluate_residual_accumulated(board: chess.Board) -> int:
+    """evaluate_residual, over the accumulator rather than a refresh."""
+    return evaluate_tables(board) + evaluate_accumulated(board)
+
+
 tablebase = load_tablebase()
 USING_NET: Final = load_net()
 
@@ -642,7 +1038,15 @@ if USING_NET:
     # load_net has already made the first call, which is what compiles the network and what
     # pays for it: inside the 90 second import budget rather than on the clock, and warmed with
     # the argument types the real calls will use. Reaching here means that call succeeded.
-    evaluate = evaluate_residual if net_state.get("residual") else evaluate_net
+    evaluate = (
+        evaluate_residual_accumulated if net_state.get("residual") else evaluate_accumulated
+    )
+
+
+def move_key(move: chess.Move) -> int:
+    """From, to and promotion in one integer. Two moves are the same move iff these match."""
+    promotion = move.promotion
+    return move.from_square | move.to_square << 6 | (promotion << 12 if promotion else 0)
 
 
 def capture_value(board: chess.Board, move: chess.Move) -> int:
@@ -665,16 +1069,18 @@ def candidates(board: chess.Board, best: chess.Move | None, ply: int) -> Iterato
     if best is not None and board.is_legal(best):
         yield best
 
-    slot = killers[ply]
+    first = move_key(best) if best is not None else -1
+    killer, spare = killers[ply]
 
     def rank(move: chess.Move) -> int:
         if board.is_capture(move) or move.promotion is not None:
             return (1 << 20) + capture_value(board, move)
-        if move in slot:
+        key = move_key(move)
+        if key == killer or key == spare:
             return 1 << 19
-        return history.get((move.from_square, move.to_square), 0)
+        return history.get(key, 0)
 
-    rest = [move for move in board.legal_moves if move != best]
+    rest = [move for move in board.legal_moves if move_key(move) != first]
     rest.sort(key=rank, reverse=True)
     yield from rest
 
@@ -709,7 +1115,7 @@ def quiesce(board: chess.Board, alpha: int, beta: int) -> int:
                 and board.is_attacked_by(not board.turn, move.to_square)
             ):
                 continue
-        board.push(move)
+        push_move(board, move)
         score = -quiesce(board, -beta, -alpha)
         board.pop()
         if score >= beta:
@@ -747,7 +1153,9 @@ def has_pieces(board: chess.Board, colour: chess.Color) -> bool:
     return bool((board.knights | board.bishops | board.rooks | board.queens) & mine)
 
 
-def negamax(board: chess.Board, depth: int, alpha: int, beta: int, ply: int) -> int:
+def negamax(
+    board: chess.Board, depth: int, alpha: int, beta: int, ply: int, checked: bool | None = None
+) -> int:
     tick()
     if board.is_insufficient_material() or board.halfmove_clock >= 100:
         return 0
@@ -755,7 +1163,9 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int, ply: int) -> 
     # Never hand a position back to the evaluation with the king under fire: the reply is
     # forced and the score is meaningless. Bounded by ply, so perpetual check cannot recurse
     # forever on an extension that keeps renewing itself.
-    in_check = board.is_check()
+    # The caller already had to know this to decide how to search the move, and asking the
+    # board again cannot give a different answer for the same position.
+    in_check = board.is_check() if checked is None else checked
     if in_check and ply < MAX_DEPTH:
         depth += 1
 
@@ -797,7 +1207,7 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int, ply: int) -> 
     # was never worth searching properly. Skipped in check, and skipped without a piece on the
     # board, because those are the positions where passing would genuinely have been best.
     if depth >= NULL_MIN_DEPTH and not in_check and has_pieces(board, board.turn):
-        board.push(chess.Move.null())
+        push_move(board, chess.Move.null())
         score = -negamax(board, depth - 1 - NULL_REDUCTION, -beta, -beta + 1, ply + 1)
         board.pop()
         if score >= beta:
@@ -808,7 +1218,10 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int, ply: int) -> 
     index = -1
     for index, move in enumerate(candidates(board, stored[3] if stored else None, ply)):
         quiet = not board.is_capture(move) and move.promotion is None
-        board.push(move)
+        push_move(board, move)
+        # Asked once here and then handed down: futility wants it, so does late move
+        # reduction, and so does every re-search of the same child at a different window.
+        gives_check = board.is_check()
 
         # Futility: a quiet move that neither captures nor checks, from a position already this
         # far below alpha, is not going to climb back over it in a couple of plies. Never the
@@ -820,7 +1233,7 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int, ply: int) -> 
             and depth <= FUTILITY_MAX_DEPTH
             and best_score > -MATE + MAX_DEPTH
             and static + FUTILITY_MARGIN * depth <= alpha
-            and not board.is_check()
+            and not gives_check
         ):
             board.pop()
             continue
@@ -829,17 +1242,19 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int, ply: int) -> 
         # ordering was right and they will not beat alpha. A move that beats it anyway is
         # re-searched at full depth, so the bet costs nothing when it is wrong.
         reduction = 0
-        if depth >= LMR_MIN_DEPTH and index >= LMR_MIN_MOVE and quiet and not board.is_check():
+        if depth >= LMR_MIN_DEPTH and index >= LMR_MIN_MOVE and quiet and not gives_check:
             reduction = 1 if index < LMR_DEEP_MOVE else 2
 
         if index == 0:
-            score = -negamax(board, depth - 1, -beta, -alpha, ply + 1)
+            score = -negamax(board, depth - 1, -beta, -alpha, ply + 1, gives_check)
         else:
-            score = -negamax(board, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1)
+            score = -negamax(
+                board, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1, gives_check
+            )
             if reduction and score > alpha:
-                score = -negamax(board, depth - 1, -alpha - 1, -alpha, ply + 1)
+                score = -negamax(board, depth - 1, -alpha - 1, -alpha, ply + 1, gives_check)
             if alpha < score < beta:
-                score = -negamax(board, depth - 1, -beta, -alpha, ply + 1)
+                score = -negamax(board, depth - 1, -beta, -alpha, ply + 1, gives_check)
 
         board.pop()
         if score > best_score:
@@ -849,10 +1264,12 @@ def negamax(board: chess.Board, depth: int, alpha: int, beta: int, ply: int) -> 
         if alpha >= beta:
             if quiet:
                 slot = killers[ply]
-                if move != slot[0]:
+                # Not "key": that name already holds this node's transposition key, and the
+                # store below needs it intact.
+                edge = move_key(move)
+                if edge != slot[0]:
                     slot[1] = slot[0]
-                    slot[0] = move
-                edge = (move.from_square, move.to_square)
+                    slot[0] = edge
                 history[edge] = history.get(edge, 0) + depth * depth
             break
 
@@ -898,6 +1315,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
     time_left_ms  your clock before this move, in milliseconds
     """
     global deadline, nodes, reached, increment_ms, last_clock_ms, last_spent_ms, extensions
+    global accumulating
 
     board = chess.Board(fen)
     legal = list(board.legal_moves)
@@ -945,6 +1363,13 @@ def get_move(fen: str, time_left_ms: int) -> str:
             last_spent_ms = (time.monotonic() - started) * 1000.0
             return answer.uci()
 
+    # From here every push goes through push_move, so the accumulator tracks the board for the
+    # whole search. The timeout below rebuilds the board at the root, which is level zero, so
+    # an abandoned iteration lands back on an accumulator that is already correct for it.
+    if USING_NET:
+        refresh_accumulator(board)
+        accumulating = True
+
     for depth in range(1, MAX_DEPTH + 1):
         best_move: chess.Move | None = None
         best_score = -INFINITY
@@ -952,7 +1377,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
         finished = False
         try:
             for move in candidates(board, choice, 0):
-                board.push(move)
+                push_move(board, move)
                 score = -negamax(board, depth - 1, -INFINITY, -alpha, 1)
                 # Returning to a position our own play has already produced walks towards
                 # the threefold the referee claims automatically, so it is only worth it when
@@ -971,7 +1396,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
                 drawn = before >= 2
                 if not drawn and repeatable and score > 0:
                     for reply in board.legal_moves:
-                        board.push(reply)
+                        push_move(board, reply)
                         drawn = seen[board._transposition_key()] >= 2
                         board.pop()
                         if drawn:
@@ -1011,6 +1436,8 @@ def get_move(fen: str, time_left_ms: int) -> str:
         if unstable:
             extensions += 1
         deadline = started + (hard if unstable else soft)
+
+    accumulating = False
 
     # Remember where this move leaves the board, so a later move returning here is counted.
     board.push(choice)
