@@ -70,6 +70,15 @@ VALUE: Final = {
 # table that wants it castled and the table that wants it marching. Minors count 1, rooks 2,
 # queens 4, so a full board is 24.
 TOTAL_PHASE: Final = 24
+# The order the compiled move ordering indexes piece values by: index is the piece type.
+PIECE_ORDER: Final = (
+    chess.PAWN,
+    chess.KNIGHT,
+    chess.BISHOP,
+    chess.ROOK,
+    chess.QUEEN,
+    chess.KING,
+)
 
 TT_LIMIT: Final = 400_000
 # Walking back to a position seen once is worth discouraging, not forbidding: sometimes
@@ -435,13 +444,13 @@ def load_fast_tables() -> bool:
     # Spelled out so the dispatcher has nothing to work out per call, and so a python int
     # is unboxed straight to a uint64 rather than wrapped by hand first. Arrays are declared
     # C contiguous, which is what np.array gives and what lets numba index them directly.
-    SIGNATURE = (
+    signature = (
         "int64(uint64, uint64, uint64, uint64, uint64, uint64, uint64, uint64, boolean,"
         " int64[:, :, :, ::1], int64[:, ::1], int64[:, ::1], uint64[:, ::1],"
         " uint64[:, :, ::1], uint64)"
     )
 
-    @njit(SIGNATURE, cache=True)
+    @njit(signature, cache=True)
     def scored(  # type: ignore[no-untyped-def]
         pawns, knights, bishops, rooks, queens, kings, white, black, white_to_move,
         placement, structural, geometry, files, zones, magic,
@@ -546,7 +555,7 @@ def load_fast_tables() -> bool:
 
     def fast(board: chess.Board) -> int:
         """The jitted tables, handed the board's own integers with no conversion in python."""
-        return scored(
+        score: int = scored(
             board.pawns,
             board.knights,
             board.bishops,
@@ -563,6 +572,7 @@ def load_fast_tables() -> bool:
             zones,
             magic,
         )
+        return score
 
     # Compile, and check it against the python before anything is rebound. A disagreement here
     # is a compile that went wrong, and the answer to that is to keep the python.
@@ -958,10 +968,21 @@ def delta(board: chess.Board, move: chess.Move) -> tuple[int, int]:
     """
     if not move:
         return 0, 0  # a null move moves no piece, and both views are kept, so nothing changes
-    piece = board.piece_type_at(move.from_square)
-    if piece is None:
+    from_bb = 1 << move.from_square
+    if board.pawns & from_bb:
+        piece = 0
+    elif board.knights & from_bb:
+        piece = 1
+    elif board.bishops & from_bb:
+        piece = 2
+    elif board.rooks & from_bb:
+        piece = 3
+    elif board.queens & from_bb:
+        piece = 4
+    elif board.kings & from_bb:
+        piece = 5
+    else:
         return 0, 0  # not a move in this position; the push below will say so
-    piece -= 1
     mover = 0 if board.turn == chess.WHITE else 1
     landed = move.promotion - 1 if move.promotion else piece
     packed = (mover << 10) | (piece << 7) | (move.from_square << 1)
@@ -981,8 +1002,20 @@ def delta(board: chess.Board, move: chess.Move) -> tuple[int, int]:
         packed |= ((mover << 10) | (rook << 7) | (rook_to << 1) | 1) << 33
         return packed, 4
 
-    if board.occupied & (1 << move.to_square):
-        victim = board.piece_type_at(move.to_square)
+    to_bb = 1 << move.to_square
+    if board.occupied & to_bb:
+        if board.pawns & to_bb:
+            victim = chess.PAWN
+        elif board.knights & to_bb:
+            victim = chess.KNIGHT
+        elif board.bishops & to_bb:
+            victim = chess.BISHOP
+        elif board.rooks & to_bb:
+            victim = chess.ROOK
+        elif board.queens & to_bb:
+            victim = chess.QUEEN
+        else:
+            victim = chess.KING
         square = move.to_square
     elif piece == chess.PAWN - 1 and move.to_square == board.ep_square:
         # A pawn reaching an empty en passant square can only have got there by taking, and the
@@ -1110,7 +1143,7 @@ def load_fast_moves() -> bool:
     one = np.uint64(1)
     shift = np.uint64(58)
 
-    def ray_table(steps):
+    def ray_table(steps: tuple[tuple[int, bool], ...]) -> Any:
         """Every square beyond a given one along each direction, for the classical scan below."""
         table = np.zeros((2, 2, 64), dtype=np.uint64)
         for index, (step, positive) in enumerate(steps):
@@ -1144,10 +1177,7 @@ def load_fast_moves() -> bool:
     bishop_rays = ray_table(((9, True), (7, True), (-9, False), (-7, False)))
     values = np.array(
         [0]
-        + [
-            VALUE[piece]
-            for piece in (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING)
-        ],
+        + [VALUE[piece] for piece in PIECE_ORDER],
         dtype=np.int64,
     )
 
@@ -1219,14 +1249,14 @@ def load_fast_moves() -> bool:
             attacks |= slide(square, occupied, rook_rays, scan)
         return attacks
 
-    GENERATE = (
+    generate_types = (
         "int64(uint64, uint64, uint64, uint64, uint64, uint64, uint64, uint64, uint64,"
         " boolean, uint64, uint64, int64[::1], uint64[::1], uint64[::1], uint64[:, ::1],"
         " uint64[:, ::1], uint64[:, ::1], uint64[::1], uint64[::1], uint64[::1],"
         " uint64[:, :, ::1], uint64[:, :, ::1], int64[::1])"
     )
 
-    @njit(GENERATE, cache=True)
+    @njit(generate_types, cache=True)
     def generate(  # type: ignore[no-untyped-def]
         pawns, knights, bishops, rooks, queens, kings, white, black, occupied,
         white_to_move, clean_castling, to_mask, out,
@@ -1283,7 +1313,7 @@ def load_fast_moves() -> bool:
                                  rooks, queens, kings, white, black, knight_t, king_t, pawn_t,
                                  rook_rays, bishop_rays, scan) != np.uint64(0):
                         continue
-                elif blockers & from_bb and (rays[from_square, to_square] & king_bb) == np.uint64(0):
+                elif blockers & from_bb and not rays[from_square, to_square] & king_bb:
                     continue
                 out[count] = from_square | to_square << 6
                 count += 1
@@ -1399,12 +1429,12 @@ def load_fast_moves() -> bool:
 
         return count
 
-    ORDER = (
+    order_types = (
         "int64(int64[::1], int64[::1], int64, int64, int64, int64, int64, int64[::1],"
         " int64[::1], uint64, uint64, uint64, uint64, uint64, uint64)"
     )
 
-    @njit(ORDER, cache=True)
+    @njit(order_types, cache=True)
     def order(  # type: ignore[no-untyped-def]
         out, ranks, count, mode, first, killer0, killer1, history, values,
         pawns, knights, bishops, rooks, queens, theirs,
@@ -1457,7 +1487,7 @@ def load_fast_moves() -> bool:
                 rank = gain * 16 - values[attacker]
                 if mode == 0:
                     rank += 1 << 20
-            elif packed == killer0 or packed == killer1:
+            elif packed in (killer0, killer1):
                 rank = 1 << 19
             else:
                 rank = history[packed]
@@ -1478,7 +1508,7 @@ def load_fast_moves() -> bool:
             ranks[slot + 1] = rank
         return kept
 
-    state = {
+    state: dict[str, Any] = {
         "out": np.zeros(256, dtype=np.int64),
         "ranks": np.zeros(256, dtype=np.int64),
         "values": values,
@@ -1541,7 +1571,7 @@ def ordered_moves(
         mine = board.pawns & board.occupied_co[board.turn]
         if chess.BB_PAWN_ATTACKS[not board.turn][square] & mine:
             return None
-    state = movegen_state
+    state: Any = movegen_state
     out = state["out"]
     count = fast_generate(
         board.pawns, board.knights, board.bishops, board.rooks, board.queens, board.kings,
@@ -1556,7 +1586,8 @@ def ordered_moves(
         board.pawns, board.knights, board.bishops, board.rooks, board.queens,
         board.occupied_co[not board.turn],
     )
-    return out[:kept].tolist()
+    packed: list[int] = out[:kept].tolist()
+    return packed
 
 
 fast_generate: Any = None
@@ -1589,9 +1620,10 @@ def candidates(board: chess.Board, best: chess.Move | None, ply: int) -> Iterato
         if board.is_capture(move) or move.promotion is not None:
             return (1 << 20) + capture_value(board, move)
         key = move_key(move)
-        if key == killer or key == spare:
+        if key in (killer, spare):
             return 1 << 19
-        return history[key]
+        scored_by_history: int = history[key]
+        return scored_by_history
 
     rest = [move for move in board.legal_moves if move_key(move) != first]
     rest.sort(key=rank, reverse=True)
@@ -1681,7 +1713,11 @@ def negamax(
     board: chess.Board, depth: int, alpha: int, beta: int, ply: int, checked: bool | None = None
 ) -> int:
     tick()
-    if board.is_insufficient_material() or board.halfmove_clock >= 100:
+    # Neither side can be short of material while a pawn, rook or queen is still on: that is
+    # the first thing python-chess checks, so testing it here skips the call outright.
+    if board.halfmove_clock >= 100 or (
+        not (board.pawns | board.rooks | board.queens) and board.is_insufficient_material()
+    ):
         return 0
 
     # Never hand a position back to the evaluation with the king under fire: the reply is
