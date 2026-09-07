@@ -30,6 +30,7 @@ deliberate act: copy the champion over agent.py when you are satisfied with it.
 """
 
 import argparse
+import atexit
 import os
 import shutil
 import signal
@@ -412,6 +413,19 @@ def main() -> None:
     check_tables()
     # Games for the next round, generated while this one trains and plays its match.
     pending: subprocess.Popen | None = None
+
+    def teardown() -> None:
+        """Whatever ends the run, the games it started do not outlive it.
+
+        The per round handler catches Exception, and KeyboardInterrupt is not one, so
+        stopping the loop by hand used to leave its whole self-play pool running with
+        nothing left to report to.
+        """
+        if pending is not None:
+            kill_tree(pending.pid)
+        kill_leftovers()
+
+    atexit.register(teardown)
     games = SELFPLAY_GAMES
     note(f"loop starting: {arguments.rounds} rounds, self-play running continuously")
 

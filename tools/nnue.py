@@ -19,6 +19,7 @@ by luck. Training against engine labels is explicitly permitted; the network tha
 import argparse
 import json
 import math
+import time
 from pathlib import Path
 
 import chess
@@ -379,6 +380,9 @@ def main() -> None:
     # Uniform to begin with; prioritised sampling replaces this once there are errors to rank by.
     priority = torch.ones(len(train), dtype=torch.float64, device=device)
     for epoch in range(arguments.epochs):
+        # Timed, because these runs are long enough that knowing an epoch's cost is the
+        # difference between watching progress and watching a cursor.
+        epoch_started = time.monotonic()
         net.train()
         if arguments.priority > 0.0 and epoch > 0:
             chance = priority / priority.sum()
@@ -393,7 +397,9 @@ def main() -> None:
             shuffled = train[torch.randperm(len(train), device=device)]
             batch_weight = torch.ones(len(train), dtype=torch.float32, device=device)
 
-        total = 0.0
+        # Kept on the device. Reading it here would block until the batch finished, and
+        # that stall, once per batch, is what left the gpu idle and one core saturated.
+        total = torch.zeros((), device=device)
         for start in range(0, len(shuffled), arguments.batch):
             span = slice(start, start + arguments.batch)
             rows_batch = shuffled[span]
@@ -405,7 +411,7 @@ def main() -> None:
             optimiser.step()
             # Report the plain error, not the importance-weighted one the gradient used, so
             # the training number stays comparable with the holdout beside it.
-            total += float(errors.detach().mean()) * len(rows_batch)
+            total += errors.detach().sum()
 
         if arguments.priority > 0.0:
             # Re-rank on what the net now gets wrong, so the next pass chases current errors
@@ -432,7 +438,9 @@ def main() -> None:
             # that an interruption should not cost a result already reached.
             save(kept, arguments.out, arguments.residual)
         print(
-            f"  epoch {epoch + 1:3}/{arguments.epochs}  train {total / len(shuffled):.6f}  "
+            f"  epoch {epoch + 1:3}/{arguments.epochs}  "
+            f"train {float(total) / len(shuffled):.6f}  "
+            f"{time.monotonic() - epoch_started:5.1f}s  "
             f"holdout {held:.6f}{'  *' if held == best else ''}"
         )
 
