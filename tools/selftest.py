@@ -39,7 +39,9 @@ def reset(agent: ModuleType) -> None:
     agent.transposition.clear()
     agent.pawn_cache.clear()
     agent.seen.clear()
-    agent.history.clear()
+    # History is a flat table rather than a dict, and may be a numpy array when the compiled
+    # move generator is in use, so it is emptied by writing zeros over it rather than cleared.
+    agent.history[:] = [0] * len(agent.history)
     agent.last_clock_ms = None
     agent.increment_ms = float(agent.ASSUMED_INCREMENT_MS)
 

@@ -232,7 +232,10 @@ transposition: dict[Hashable, tuple[int, int, int, chess.Move | None]] = {}
 # Killers and history are keyed by move_key rather than by Move: the objects are dataclasses
 # and comparing them is one of the more expensive things the ordering used to do.
 killers: list[list[int]] = [[-1, -1] for _ in range(MAX_DEPTH + 2)]
-history: dict[int, int] = {}
+# Indexed by move_key of a quiet move, which never exceeds from | to << 6, so the whole
+# range fits in one flat table and a miss is a zero already sitting there.
+HISTORY_SLOTS: Final = 1 << 12
+history: Any = [0] * HISTORY_SLOTS
 # Counted, not just remembered. The referee claims the draw on the third occurrence, so
 # the difference between having been somewhere once and twice is the difference between
 # a nudge away from a line and the line being worth exactly nothing.
@@ -1059,6 +1062,507 @@ def capture_value(board: chess.Board, move: chess.Move) -> int:
     return gain * 16 - (VALUE[attacker] if attacker is not None else 0)
 
 
+# Positions the generator must reproduce before it is allowed anywhere near the search: castling
+# from both sides, a pinned piece, promotions with and without a capture, and a position in check
+# so the hand-back path is exercised too.
+MOVEGEN_PROBES: Final = (
+    chess.STARTING_FEN,
+    "r3k2r/pppq1ppp/2npbn2/2b1p3/2B1P3/2NPBN2/PPPQ1PPP/R3K2R w KQkq - 0 1",
+    "r3k2r/pppq1ppp/2npbn2/2b1p3/2B1P3/2NPBN2/PPPQ1PPP/R3K2R b KQkq - 0 1",
+    "8/PPPk4/8/8/8/8/4Kppp/8 w - - 0 1",
+    "8/PPPk4/8/8/8/8/4Kppp/8 b - - 0 1",
+    "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5Q2/PPPP1PPP/RNB1K1NR w KQkq - 4 4",
+    "4k3/8/8/8/8/8/4r3/4K3 w - - 0 1",
+    "rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3",
+    "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+    "n1n5/PPPk4/8/8/8/8/4Kppp/5N1N b - - 0 1",
+    "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+)
+
+
+def load_fast_moves() -> bool:
+    """Compile a move generator that reproduces python-chess move for move, or keep python-chess.
+
+    Move generation is the largest thing left in the search by a distance, and python-chess does
+    it in python. This does it in one compiled call. What it must not do is reorder anything:
+    the search sorts with a stable sort, so moves that tie on rank come out in generation order,
+    and a generator that produced the same moves in a different sequence would search a different
+    move first and play a different game. So it follows python-chess phase for phase.
+
+    Two shapes are handed straight back rather than reimplemented: being in check, which has its
+    own evasion generator with its own order, and a position where an en passant capture is
+    available, whose legality needs a skewer test for one rare move. Together they are about one
+    node in twenty, and python-chess answers those exactly as before.
+    """
+    global history, fast_generate, fast_order, movegen_state
+
+    try:
+        import os
+        import tempfile
+
+        os.environ.setdefault("NUMBA_CACHE_DIR", tempfile.gettempdir())
+        import numpy as np
+        from numba import njit
+    except ImportError:
+        return False
+
+    magic = np.uint64(0x03F79D71B4CB0A89)
+    one = np.uint64(1)
+    shift = np.uint64(58)
+
+    def ray_table(steps):
+        """Every square beyond a given one along each direction, for the classical scan below."""
+        table = np.zeros((2, 2, 64), dtype=np.uint64)
+        for index, (step, positive) in enumerate(steps):
+            for square in range(64):
+                mask = 0
+                current = square
+                while True:
+                    nxt = current + step
+                    # Off the board, or wrapped round its edge, and the ray has ended.
+                    if not 0 <= nxt < 64 or abs((nxt % 8) - (current % 8)) > 1:
+                        break
+                    mask |= 1 << nxt
+                    current = nxt
+                table[0 if positive else 1, index % 2, square] = mask
+        return table
+
+    scan = np.zeros(64, dtype=np.int64)
+    for square in range(64):
+        scan[(((1 << square) * 0x03F79D71B4CB0A89) & 0xFFFFFFFFFFFFFFFF) >> 58] = square
+    knight_t = np.array(chess.BB_KNIGHT_ATTACKS, dtype=np.uint64)
+    king_t = np.array(chess.BB_KING_ATTACKS, dtype=np.uint64)
+    pawn_t = np.array([chess.BB_PAWN_ATTACKS[0], chess.BB_PAWN_ATTACKS[1]], dtype=np.uint64)
+    rays = np.array([[chess.ray(a, b) for b in range(64)] for a in range(64)], dtype=np.uint64)
+    between = np.array(
+        [[chess.between(a, b) for b in range(64)] for a in range(64)], dtype=np.uint64
+    )
+    rank_empty = np.array([chess.BB_RANK_ATTACKS[s][0] for s in range(64)], dtype=np.uint64)
+    file_empty = np.array([chess.BB_FILE_ATTACKS[s][0] for s in range(64)], dtype=np.uint64)
+    diag_empty = np.array([chess.BB_DIAG_ATTACKS[s][0] for s in range(64)], dtype=np.uint64)
+    rook_rays = ray_table(((8, True), (1, True), (-8, False), (-1, False)))
+    bishop_rays = ray_table(((9, True), (7, True), (-9, False), (-7, False)))
+    values = np.array(
+        [0]
+        + [
+            VALUE[piece]
+            for piece in (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING)
+        ],
+        dtype=np.int64,
+    )
+
+    @njit(cache=True, inline="always")
+    def lowest_bit(mask, scan):  # type: ignore[no-untyped-def]
+        return scan[((mask & (~mask + one)) * magic) >> shift]
+
+    @njit(cache=True, inline="always")
+    def highest_bit(mask, scan):  # type: ignore[no-untyped-def]
+        """Smear every bit below the top one down, then isolate it."""
+        mask |= mask >> np.uint64(1)
+        mask |= mask >> np.uint64(2)
+        mask |= mask >> np.uint64(4)
+        mask |= mask >> np.uint64(8)
+        mask |= mask >> np.uint64(16)
+        mask |= mask >> np.uint64(32)
+        return scan[((mask ^ (mask >> np.uint64(1))) * magic) >> shift]
+
+    @njit(cache=True)
+    def slide(square, occupied, dirs, scan):  # type: ignore[no-untyped-def]
+        """Classical ray attacks: run each direction out to its first blocker, inclusive."""
+        attacks = np.uint64(0)
+        for direction in range(2):
+            ray = dirs[0, direction, square]
+            blockers = ray & occupied
+            if blockers:
+                ray &= ~dirs[0, direction, lowest_bit(blockers, scan)]
+            attacks |= ray
+        for direction in range(2):
+            ray = dirs[1, direction, square]
+            blockers = ray & occupied
+            if blockers:
+                ray &= ~dirs[1, direction, highest_bit(blockers, scan)]
+            attacks |= ray
+        return attacks
+
+    @njit(cache=True)
+    def attackers(  # type: ignore[no-untyped-def]
+        by_white, square, occupied, pawns, knights, bishops, rooks, queens, kings, white, black,
+        knight_t, king_t, pawn_t, rook_rays, bishop_rays, scan,
+    ):
+        """Every piece of one colour bearing on a square, for a given occupancy."""
+        straight = slide(square, occupied, rook_rays, scan)
+        diagonal = slide(square, occupied, bishop_rays, scan)
+        found = (
+            (king_t[square] & kings)
+            | (knight_t[square] & knights)
+            | (straight & (queens | rooks))
+            | (diagonal & (queens | bishops))
+            | (pawn_t[0 if by_white else 1, square] & pawns)
+        )
+        return found & (white if by_white else black)
+
+    @njit(cache=True)
+    def piece_attacks(  # type: ignore[no-untyped-def]
+        square, bb, occupied, pawns, knights, bishops, rooks, queens, kings, white,
+        knight_t, king_t, pawn_t, rook_rays, bishop_rays, scan,
+    ):
+        if bb & pawns:
+            return pawn_t[1 if bb & white else 0, square]
+        if bb & knights:
+            return knight_t[square]
+        if bb & kings:
+            return king_t[square]
+        attacks = np.uint64(0)
+        if bb & bishops or bb & queens:
+            attacks = slide(square, occupied, bishop_rays, scan)
+        if bb & rooks or bb & queens:
+            attacks |= slide(square, occupied, rook_rays, scan)
+        return attacks
+
+    GENERATE = (
+        "int64(uint64, uint64, uint64, uint64, uint64, uint64, uint64, uint64, uint64,"
+        " boolean, uint64, uint64, int64[::1], uint64[::1], uint64[::1], uint64[:, ::1],"
+        " uint64[:, ::1], uint64[:, ::1], uint64[::1], uint64[::1], uint64[::1],"
+        " uint64[:, :, ::1], uint64[:, :, ::1], int64[::1])"
+    )
+
+    @njit(GENERATE, cache=True)
+    def generate(  # type: ignore[no-untyped-def]
+        pawns, knights, bishops, rooks, queens, kings, white, black, occupied,
+        white_to_move, clean_castling, to_mask, out,
+        knight_t, king_t, pawn_t, rays, between, rank_empty, file_empty, diag_empty,
+        rook_rays, bishop_rays, scan,
+    ):
+        """Legal moves, packed as from | to << 6 | promotion << 12, in python-chess's order.
+
+        Returns the count, or -1 for a position that has to go back to python-chess.
+        """
+        ours = white if white_to_move else black
+        theirs = black if white_to_move else white
+        king_bb = kings & ours
+        if king_bb == np.uint64(0):
+            return -1
+        king = highest_bit(king_bb, scan)
+
+        if attackers(not white_to_move, king, occupied, pawns, knights, bishops, rooks, queens,
+                     kings, white, black, knight_t, king_t, pawn_t, rook_rays, bishop_rays,
+                     scan) != np.uint64(0):
+            return -1
+
+        # Our own pieces standing alone between our king and an enemy slider: the pinned ones.
+        snipers = (
+            ((rank_empty[king] | file_empty[king]) & (rooks | queens))
+            | (diag_empty[king] & (bishops | queens))
+        ) & theirs
+        blockers = np.uint64(0)
+        while snipers:
+            sniper = highest_bit(snipers, scan)
+            snipers ^= np.uint64(1) << np.uint64(sniper)
+            occupied_between = between[king, sniper] & occupied
+            if occupied_between and (occupied_between & (occupied_between - one)) == np.uint64(0):
+                blockers |= occupied_between
+        blockers &= ours
+
+        count = 0
+
+        # Everything that is not a pawn, highest square first, targets highest first.
+        remaining = ours & ~pawns
+        while remaining:
+            from_square = highest_bit(remaining, scan)
+            from_bb = np.uint64(1) << np.uint64(from_square)
+            remaining ^= from_bb
+            targets = piece_attacks(
+                from_square, from_bb, occupied, pawns, knights, bishops, rooks, queens, kings,
+                white, knight_t, king_t, pawn_t, rook_rays, bishop_rays, scan,
+            ) & ~ours & to_mask
+            while targets:
+                to_square = highest_bit(targets, scan)
+                targets ^= np.uint64(1) << np.uint64(to_square)
+                if from_square == king:
+                    if attackers(not white_to_move, to_square, occupied, pawns, knights, bishops,
+                                 rooks, queens, kings, white, black, knight_t, king_t, pawn_t,
+                                 rook_rays, bishop_rays, scan) != np.uint64(0):
+                        continue
+                elif blockers & from_bb and (rays[from_square, to_square] & king_bb) == np.uint64(0):
+                    continue
+                out[count] = from_square | to_square << 6
+                count += 1
+
+        # Castling, which python-chess yields after the piece moves and before the pawns.
+        backrank = np.uint64(0xFF) if white_to_move else np.uint64(0xFF00000000000000)
+        home = king_bb & backrank
+        if home:
+            rights = clean_castling & backrank & to_mask
+            while rights:
+                rook_square = highest_bit(rights, scan)
+                rook_bb = np.uint64(1) << np.uint64(rook_square)
+                rights ^= rook_bb
+                if rook_bb < home:
+                    king_to_bb = np.uint64(0x04) if white_to_move else np.uint64(0x0400000000000000)
+                    rook_to_bb = np.uint64(0x08) if white_to_move else np.uint64(0x0800000000000000)
+                else:
+                    king_to_bb = np.uint64(0x40) if white_to_move else np.uint64(0x4000000000000000)
+                    rook_to_bb = np.uint64(0x20) if white_to_move else np.uint64(0x2000000000000000)
+                king_to = highest_bit(king_to_bb, scan)
+                king_path = between[king, king_to]
+                rook_path = between[rook_square, highest_bit(rook_to_bb, scan)]
+                if (occupied ^ home ^ rook_bb) & (king_path | rook_path | king_to_bb | rook_to_bb):
+                    continue
+                # The king may not start in, pass through, or land on an attacked square, and
+                # each leg is tested with the pieces that have already moved taken off.
+                walk = king_path | home
+                trimmed = occupied ^ home
+                blocked = False
+                while walk:
+                    square = highest_bit(walk, scan)
+                    walk ^= np.uint64(1) << np.uint64(square)
+                    if attackers(not white_to_move, square, trimmed, pawns, knights, bishops,
+                                 rooks, queens, kings, white, black, knight_t, king_t, pawn_t,
+                                 rook_rays, bishop_rays, scan):
+                        blocked = True
+                        break
+                if blocked:
+                    continue
+                trimmed = occupied ^ home ^ rook_bb ^ rook_to_bb
+                if attackers(not white_to_move, king_to, trimmed, pawns, knights, bishops, rooks,
+                             queens, kings, white, black, knight_t, king_t, pawn_t, rook_rays,
+                             bishop_rays, scan):
+                    continue
+                out[count] = king | king_to << 6
+                count += 1
+
+        our_pawns = pawns & ours
+        if our_pawns == np.uint64(0):
+            return count
+
+        # Pawn captures, promoting queen, rook, bishop, knight, in that order.
+        remaining = our_pawns
+        while remaining:
+            from_square = highest_bit(remaining, scan)
+            from_bb = np.uint64(1) << np.uint64(from_square)
+            remaining ^= from_bb
+            targets = pawn_t[1 if white_to_move else 0, from_square] & theirs & to_mask
+            while targets:
+                to_square = highest_bit(targets, scan)
+                targets ^= np.uint64(1) << np.uint64(to_square)
+                if blockers & from_bb and (rays[from_square, to_square] & king_bb) == np.uint64(0):
+                    continue
+                packed = from_square | to_square << 6
+                if to_square >= 56 or to_square < 8:
+                    out[count] = packed | 5 << 12
+                    out[count + 1] = packed | 4 << 12
+                    out[count + 2] = packed | 3 << 12
+                    out[count + 3] = packed | 2 << 12
+                    count += 4
+                else:
+                    out[count] = packed
+                    count += 1
+
+        # Single then double advances. The double set comes off the single set before to_mask
+        # narrows it, which is how python-chess computes it and matters when to_mask is a filter.
+        if white_to_move:
+            singles = (our_pawns << np.uint64(8)) & ~occupied
+            doubles = (singles << np.uint64(8)) & ~occupied & np.uint64(0x00000000FFFF0000)
+        else:
+            singles = (our_pawns >> np.uint64(8)) & ~occupied
+            doubles = (singles >> np.uint64(8)) & ~occupied & np.uint64(0x0000FFFF00000000)
+        singles &= to_mask
+        doubles &= to_mask
+
+        while singles:
+            to_square = highest_bit(singles, scan)
+            singles ^= np.uint64(1) << np.uint64(to_square)
+            from_square = to_square - 8 if white_to_move else to_square + 8
+            from_bb = np.uint64(1) << np.uint64(from_square)
+            if blockers & from_bb and (rays[from_square, to_square] & king_bb) == np.uint64(0):
+                continue
+            packed = from_square | to_square << 6
+            if to_square >= 56 or to_square < 8:
+                out[count] = packed | 5 << 12
+                out[count + 1] = packed | 4 << 12
+                out[count + 2] = packed | 3 << 12
+                out[count + 3] = packed | 2 << 12
+                count += 4
+            else:
+                out[count] = packed
+                count += 1
+
+        while doubles:
+            to_square = highest_bit(doubles, scan)
+            doubles ^= np.uint64(1) << np.uint64(to_square)
+            from_square = to_square - 16 if white_to_move else to_square + 16
+            from_bb = np.uint64(1) << np.uint64(from_square)
+            if blockers & from_bb and (rays[from_square, to_square] & king_bb) == np.uint64(0):
+                continue
+            out[count] = from_square | to_square << 6
+            count += 1
+
+        return count
+
+    ORDER = (
+        "int64(int64[::1], int64[::1], int64, int64, int64, int64, int64, int64[::1],"
+        " int64[::1], uint64, uint64, uint64, uint64, uint64, uint64)"
+    )
+
+    @njit(ORDER, cache=True)
+    def order(  # type: ignore[no-untyped-def]
+        out, ranks, count, mode, first, killer0, killer1, history, values,
+        pawns, knights, bishops, rooks, queens, theirs,
+    ):
+        """Rank and sort in place, exactly as the python ordering did.
+
+        A packed move is its own move_key, so killers and history need nothing built first. The
+        sort is insertion sort: quick at this size and, which is the point, stable. It moves an
+        entry left only past a strictly smaller rank, so ties keep generation order, and that is
+        what decides which of two equally ranked moves the search tries first.
+        """
+        kept = 0
+        for index in range(count):
+            packed = out[index]
+            if packed == first:
+                continue
+            from_bb = np.uint64(1) << np.uint64(packed & 63)
+            to_bb = np.uint64(1) << np.uint64((packed >> 6) & 63)
+            promotion = packed >> 12
+
+            if to_bb & pawns:
+                victim = 1
+            elif to_bb & knights:
+                victim = 2
+            elif to_bb & bishops:
+                victim = 3
+            elif to_bb & rooks:
+                victim = 4
+            elif to_bb & queens:
+                victim = 5
+            else:
+                victim = 0
+
+            if mode == 1 or (to_bb & theirs) or promotion:
+                gain = values[victim] if victim else values[1]
+                if promotion:
+                    gain += values[promotion]
+                if from_bb & pawns:
+                    attacker = 1
+                elif from_bb & knights:
+                    attacker = 2
+                elif from_bb & bishops:
+                    attacker = 3
+                elif from_bb & rooks:
+                    attacker = 4
+                elif from_bb & queens:
+                    attacker = 5
+                else:
+                    attacker = 6
+                rank = gain * 16 - values[attacker]
+                if mode == 0:
+                    rank += 1 << 20
+            elif packed == killer0 or packed == killer1:
+                rank = 1 << 19
+            else:
+                rank = history[packed]
+
+            out[kept] = packed
+            ranks[kept] = rank
+            kept += 1
+
+        for index in range(1, kept):
+            move = out[index]
+            rank = ranks[index]
+            slot = index - 1
+            while slot >= 0 and ranks[slot] < rank:
+                out[slot + 1] = out[slot]
+                ranks[slot + 1] = ranks[slot]
+                slot -= 1
+            out[slot + 1] = move
+            ranks[slot + 1] = rank
+        return kept
+
+    state = {
+        "out": np.zeros(256, dtype=np.int64),
+        "ranks": np.zeros(256, dtype=np.int64),
+        "values": values,
+        "tables": (
+            knight_t, king_t, pawn_t, rays, between, rank_empty, file_empty, diag_empty,
+            rook_rays, bishop_rays, scan,
+        ),
+    }
+    table = np.array(history, dtype=np.int64)
+
+    previous = fast_generate, fast_order, movegen_state, history
+    fast_generate, fast_order, movegen_state, history = generate, order, state, table
+    def unpack(value: int) -> chess.Move:
+        return chess.Move(int(value) & 63, (int(value) >> 6) & 63, (int(value) >> 12) or None)
+
+    def unranked(board: chess.Board, move: chess.Move) -> int:
+        capture = board.is_capture(move) or move.promotion is not None
+        return (1 << 20) + capture_value(board, move) if capture else 0
+
+    try:
+        for fen in MOVEGEN_PROBES:
+            board = chess.Board(fen)
+            legal = list(board.legal_moves)
+            # Generation order first, because that is what the stable sort falls back on when
+            # moves tie: a generator that agreed only on the set would still play a different
+            # game. Ranking is checked separately, below, against the python ordering.
+            count = generate(
+                board.pawns, board.knights, board.bishops, board.rooks, board.queens,
+                board.kings, board.occupied_co[chess.WHITE], board.occupied_co[chess.BLACK],
+                board.occupied, board.turn == chess.WHITE, board.clean_castling_rights(),
+                chess.BB_ALL, state["out"], *state["tables"],
+            )
+            if count < 0:
+                continue  # handed back, and python-chess answers it exactly as it always did
+            if [unpack(value) for value in state["out"][:count]] != legal:
+                raise ValueError(fen)
+            packed = ordered_moves(board, chess.BB_ALL, 0, -1, -1, -1)
+            if packed is None:
+                continue
+            expected = sorted(legal, key=lambda move: unranked(board, move), reverse=True)
+            if [unpack(value) for value in packed] != expected:
+                raise ValueError(fen)
+    # A compile that disagrees with python-chess is a compile that does not get used.
+    except Exception:
+        fast_generate, fast_order, movegen_state, history = previous
+        return False
+    return True
+
+
+def ordered_moves(
+    board: chess.Board, to_mask: int, mode: int, first: int, killer0: int, killer1: int
+) -> list[int] | None:
+    """The ordered move list as packed integers, or None where python-chess has to do it.
+
+    The packed integers are copied out of the shared buffer before returning, because the search
+    holds this list open across recursive calls that will use the buffer again.
+    """
+    square = board.ep_square
+    if square is not None:
+        mine = board.pawns & board.occupied_co[board.turn]
+        if chess.BB_PAWN_ATTACKS[not board.turn][square] & mine:
+            return None
+    state = movegen_state
+    out = state["out"]
+    count = fast_generate(
+        board.pawns, board.knights, board.bishops, board.rooks, board.queens, board.kings,
+        board.occupied_co[chess.WHITE], board.occupied_co[chess.BLACK], board.occupied,
+        board.turn == chess.WHITE, board.clean_castling_rights(), to_mask, out,
+        *state["tables"],
+    )
+    if count < 0:
+        return None
+    kept = fast_order(
+        out, state["ranks"], count, mode, first, killer0, killer1, history, state["values"],
+        board.pawns, board.knights, board.bishops, board.rooks, board.queens,
+        board.occupied_co[not board.turn],
+    )
+    return out[:kept].tolist()
+
+
+fast_generate: Any = None
+fast_order: Any = None
+movegen_state: Any = None
+USING_FAST_MOVES: Final = load_fast_moves()
 def candidates(board: chess.Board, best: chess.Move | None, ply: int) -> Iterator[chess.Move]:
     """The transposition move first, then captures, then the quiet moves that have been cutting.
 
@@ -1072,13 +1576,22 @@ def candidates(board: chess.Board, best: chess.Move | None, ply: int) -> Iterato
     first = move_key(best) if best is not None else -1
     killer, spare = killers[ply]
 
+    if USING_FAST_MOVES:
+        packed = ordered_moves(board, chess.BB_ALL, 0, first, killer, spare)
+        if packed is not None:
+            # Built one at a time as they are asked for: most of this list is never reached,
+            # because the ordering exists so that the first move or two causes the cut.
+            for value in packed:
+                yield chess.Move(value & 63, (value >> 6) & 63, (value >> 12) or None)
+            return
+
     def rank(move: chess.Move) -> int:
         if board.is_capture(move) or move.promotion is not None:
             return (1 << 20) + capture_value(board, move)
         key = move_key(move)
         if key == killer or key == spare:
             return 1 << 19
-        return history.get(key, 0)
+        return history[key]
 
     rest = [move for move in board.legal_moves if move_key(move) != first]
     rest.sort(key=rank, reverse=True)
@@ -1093,9 +1606,20 @@ def quiesce(board: chess.Board, alpha: int, beta: int) -> int:
         return beta
     alpha = max(alpha, standing)
 
-    captures = sorted(
-        board.generate_legal_captures(), key=lambda move: capture_value(board, move), reverse=True
-    )
+    captures: Iterator[chess.Move] | list[chess.Move] | None = None
+    if USING_FAST_MOVES:
+        packed = ordered_moves(board, board.occupied_co[not board.turn], 1, -1, -1, -1)
+        if packed is not None:
+            captures = (
+                chess.Move(value & 63, (value >> 6) & 63, (value >> 12) or None)
+                for value in packed
+            )
+    if captures is None:
+        captures = sorted(
+            board.generate_legal_captures(),
+            key=lambda move: capture_value(board, move),
+            reverse=True,
+        )
     for move in captures:
         # Delta pruning: if winning the piece outright still falls short of alpha, the whole
         # line is irrelevant and searching it is time spent proving something already known.
@@ -1270,7 +1794,7 @@ def negamax(
                 if edge != slot[0]:
                     slot[1] = slot[0]
                     slot[0] = edge
-                history[edge] = history.get(edge, 0) + depth * depth
+                history[edge] += depth * depth
             break
 
     # Nothing was yielded, so there was nothing legal to play: mate if the king is attacked,
