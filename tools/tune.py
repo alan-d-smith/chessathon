@@ -18,6 +18,7 @@ little to say about keeps its sensible default instead of drifting somewhere str
 import argparse
 import json
 import math
+import multiprocessing
 from pathlib import Path
 
 import chess
@@ -102,19 +103,47 @@ def load(path: Path, limit: int | None, quiet_only: bool = False) -> tuple[list[
     return fens, targets
 
 
-def extract(fens: list[str]) -> torch.Tensor:
+def _chunk(fens: list[str]) -> tuple[list[int], list[int], list[float]]:
+    """Feature triples for a slice of positions, as plain lists a pool can pickle back."""
+    rows: list[int] = []
+    columns: list[int] = []
+    values: list[float] = []
+    for row, fen in enumerate(fens):
+        indices, weights_ = features.vector(chess.Board(fen))
+        rows.extend([row] * len(indices))
+        columns.extend(indices)
+        values.extend(weights_)
+    return rows, columns, values
+
+
+def extract(fens: list[str], workers: int = 0) -> torch.Tensor:
     """The feature matrix, one row per position.
 
     Dense on purpose. Each row is only about eighty non-zeros out of eight hundred, but a
     few hundred thousand rows still fit in memory several times over, and a dense matrix makes
     the model an ordinary matrix multiply rather than a scatter-add with hand-managed offsets.
+
+    Extracted across every core. One position is independent of every other, and doing them one
+    at a time left seventy-one cores idle while the one did an hour of work -- which is most of
+    the wall time of a fit, and all of it avoidable.
     """
     matrix = torch.zeros((len(fens), features.FEATURES), dtype=torch.float32)
-    for row, fen in enumerate(fens):
-        indices, values = features.vector(chess.Board(fen))
-        matrix[row, torch.tensor(indices, dtype=torch.long)] = torch.tensor(
+    workers = workers or max(1, int(multiprocessing.cpu_count() * 0.8))
+    if workers == 1 or len(fens) < 20_000:
+        rows, columns, values = _chunk(fens)
+        matrix[torch.tensor(rows), torch.tensor(columns)] = torch.tensor(
             values, dtype=torch.float32
         )
+        return matrix
+
+    size = (len(fens) + workers - 1) // workers
+    slices = [fens[start : start + size] for start in range(0, len(fens), size)]
+    with multiprocessing.Pool(workers) as pool:
+        for index, (rows, columns, values) in enumerate(pool.map(_chunk, slices)):
+            base = index * size
+            matrix[torch.tensor(rows) + base, torch.tensor(columns)] = torch.tensor(
+                values, dtype=torch.float32
+            )
     return matrix
 
 
