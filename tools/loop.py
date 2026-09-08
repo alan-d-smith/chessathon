@@ -318,6 +318,16 @@ def main() -> None:
     parser.add_argument("--hidden", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--priority", type=float, default=0.6)
+    parser.add_argument(
+        "--window",
+        type=int,
+        default=2_000_000,
+        help=(
+            "how many of the most recent positions a round trains on. The pool keeps "
+            "everything; without a window a round's own games are a fraction of a "
+            "percent of what it fits, and every round produces the same network"
+        ),
+    )
     parser.add_argument("--workers", type=int, default=48)
     parser.add_argument(
         "--stage-limit",
@@ -470,7 +480,8 @@ def main() -> None:
                 note(f"round {round_number}: labelling failed, skipping round")
                 continue
             total = sum(1 for _ in LABELS.open(encoding="utf-8"))
-            epochs = max(MIN_EPOCHS, min(arguments.epochs, TARGET_SAMPLES // max(total, 1)))
+            fitted = min(total, arguments.window) if arguments.window else total
+            epochs = max(MIN_EPOCHS, min(arguments.epochs, TARGET_SAMPLES // max(fitted, 1)))
             note(
                 f"round {round_number}: {total:,} labelled positions in the pool, "
                 f"{epochs} epochs"
@@ -490,6 +501,7 @@ def main() -> None:
                     "--epochs", str(epochs),
                     "--rate", arguments.rate,
                     "--priority", str(arguments.priority),
+                    "--window", str(arguments.window),
                     # Both signals: the engine score for precision, the game result for truth.
                     "--outcomes", str(OUTCOMES),
                     "--outcome-weight", str(arguments.outcome_weight),

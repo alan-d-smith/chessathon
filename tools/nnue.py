@@ -314,6 +314,15 @@ def main() -> None:
     parser.add_argument("--rate", type=float, default=1e-3)
     parser.add_argument("--holdout", type=float, default=0.1)
     parser.add_argument("--limit", type=int)
+    parser.add_argument(
+        "--window",
+        type=int,
+        help=(
+            "train on only the most recent positions. The pool keeps everything, but a "
+            "round whose own games are a fraction of a percent of what it fits cannot "
+            "learn anything from them"
+        ),
+    )
     parser.add_argument("--warm", type=Path, help="start from an existing net instead of noise")
     parser.add_argument(
         "--residual",
@@ -352,6 +361,12 @@ def main() -> None:
         print(f"  training on {torch.cuda.get_device_name(0)}")
 
     block, lengths, targets, tables, fens = cached(arguments.data, arguments.limit)
+    if arguments.window and len(lengths) > arguments.window:
+        # The cache keeps every position; this only narrows what is fitted this round.
+        recent = slice(len(lengths) - arguments.window, None)
+        block, lengths = block[recent], lengths[recent]
+        targets, tables, fens = targets[recent], tables[recent], fens[recent]
+        print(f"  training on the most recent {arguments.window:,} positions")
     count = len(lengths)
     print(f"{count:,} positions, {arguments.hidden} hidden units")
     if count < 5_000:
