@@ -10,7 +10,6 @@ first, so most of the code below is about move ordering; and a flag is a whole p
 search abandons a depth rather than finish it, and get_move always has a legal move in hand.
 """
 
-import hashlib
 import os
 import sys
 import time
@@ -23,10 +22,6 @@ from typing import Any, Final
 import chess
 
 import weights
-
-# Bumped when a build is frozen for upload. The digest below is what actually identifies a
-# build; this is only here so a log is readable without looking anything up.
-VERSION: Final = "v10"
 
 INFINITY: Final = 1 << 20
 MATE: Final = 1 << 16
@@ -1875,35 +1870,6 @@ def budget_s(time_left_ms: int, move_number: int) -> tuple[float, float]:
     return min(share, ceiling) / 1000.0, min(share * EXTENSION_FACTOR, ceiling) / 1000.0
 
 
-def identify() -> None:
-    """Announce the build, before a single move is played.
-
-    A rated game is read days later from its moves alone, and the first question is always which
-    upload played it. Answering that by replaying candidates and counting agreements is slow and
-    inconclusive; saying it at the time is neither. The digest covers this file and the network
-    beside it, so it describes the bytes that are running rather than what a constant claims.
-
-    The loader flags ride along because the other thing a log should never leave open is whether
-    the compiled evaluation and move generator came up on that machine, or whether it spent the
-    game on the python fallback.
-    """
-    with suppress(Exception):
-        digest = hashlib.sha256()
-        here = Path(__file__).resolve()
-        digest.update(here.read_bytes())
-        net = here.parent / "weights" / "net.npz"
-        if net.is_file():
-            digest.update(net.read_bytes())
-        units = net_state["hidden_b"].shape[0] if USING_NET else 0
-        print(
-            f"checkers {VERSION} build={digest.hexdigest()[:12]} units={units} "
-            f"net={USING_NET} tables={USING_FAST_TABLES} moves={USING_FAST_MOVES} "
-            f"syzygy={tablebase is not None}",
-            file=sys.stderr,
-            flush=True,
-        )
-
-
 def trace(move: chess.Move, depth: int, searched: int, spent_ms: float) -> None:
     """Record what the search did, on stderr, where the referee keeps it.
 
@@ -2064,6 +2030,3 @@ def get_move(fen: str, time_left_ms: int) -> str:
     last_spent_ms = (time.monotonic() - started) * 1000.0
     trace(choice, reached, nodes, last_spent_ms)
     return choice.uci()
-
-
-identify()
