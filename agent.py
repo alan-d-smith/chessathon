@@ -11,9 +11,11 @@ search abandons a depth rather than finish it, and get_move always has a legal m
 """
 
 import os
+import sys
 import time
 from collections import Counter
 from collections.abc import Hashable, Iterator
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Final
 
@@ -1868,6 +1870,25 @@ def budget_s(time_left_ms: int, move_number: int) -> tuple[float, float]:
     return min(share, ceiling) / 1000.0, min(share * EXTENSION_FACTOR, ceiling) / 1000.0
 
 
+def trace(move: chess.Move, depth: int, searched: int, spent_ms: float) -> None:
+    """Record what the search did, on stderr, where the referee keeps it.
+
+    A rated game is played on another machine against a clock, so the number of nodes behind a
+    move is not recoverable from the record afterwards: the moves and the clocks are not enough,
+    because a search that spends a different number of nodes leaves a different transposition
+    table and the move after it reads that table. Saying so at the time is the only way a game
+    can be replayed exactly rather than approximately.
+
+    stdout carries the move and nothing else may go there. Failing to write must never cost a
+    game, so it cannot raise.
+    """
+    # A log that cannot be written is not worth a forfeit.
+    with suppress(Exception):
+        print(
+            f"{move.uci()} d{depth} n{searched} t{spent_ms:.0f}", file=sys.stderr, flush=True
+        )
+
+
 def get_move(fen: str, time_left_ms: int) -> str:
     """Return a legal move in UCI notation.
 
@@ -1921,6 +1942,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
             board.pop()
             last_clock_ms = float(time_left_ms)
             last_spent_ms = (time.monotonic() - started) * 1000.0
+            trace(answer, 0, 0, last_spent_ms)
             return answer.uci()
 
     # From here every push goes through push_move, so the accumulator tracks the board for the
@@ -2006,4 +2028,5 @@ def get_move(fen: str, time_left_ms: int) -> str:
 
     last_clock_ms = float(time_left_ms)
     last_spent_ms = (time.monotonic() - started) * 1000.0
+    trace(choice, reached, nodes, last_spent_ms)
     return choice.uci()
