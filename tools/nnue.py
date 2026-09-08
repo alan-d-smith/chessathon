@@ -150,7 +150,7 @@ def blend_targets(
 
 def cached(
     source: Path, limit: int | None
-) -> tuple[list[list[int]], list[float], list[float], list[str]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str]]:
     """Extract features, reusing anything already extracted from an earlier run.
 
     The labelled pool only ever grows, so the features of the first N positions never change.
@@ -159,57 +159,59 @@ def cached(
     """
     store = source.with_suffix(".features.npz")
     names = source.with_suffix(".fens.txt")
-    rows: list[list[int]] = []
-    targets: list[float] = []
-    tables: list[float] = []
+    packed = np.zeros((0, 1), dtype=np.int32)
+    lengths = np.zeros(0, dtype=np.int32)
+    targets = np.zeros(0, dtype=np.float32)
+    tables = np.zeros(0, dtype=np.float32)
     fens: list[str] = []
     done = 0
     if store.is_file():
         try:
             with np.load(store) as data:
+                # Read as arrays and kept that way. Turning these into a list per position, and
+                # packing them back to append to them, was the whole cost of a training round.
                 packed, lengths = data["packed"], data["lengths"]
-                scores, scored = data["targets"], data["tables"]
-            rows = [packed[i, : lengths[i]].tolist() for i in range(len(lengths))]
-            targets = scores.tolist()
-            tables = scored.tolist()
+                targets, tables = data["targets"], data["tables"]
             fens = names.read_text(encoding="utf-8").splitlines() if names.is_file() else []
-            if len(fens) != len(rows):
+            if len(fens) != len(lengths):
                 raise ValueError("cached positions and their names disagree")
             done = int(data_lines_consumed(store))
-            print(f"  reused features for {len(rows):,} positions")
+            print(f"  reused features for {len(lengths):,} positions")
         except (OSError, KeyError, ValueError):
-            rows, targets, tables, fens, done = [], [], [], [], 0
+            packed = np.zeros((0, 1), dtype=np.int32)
+            lengths = np.zeros(0, dtype=np.int32)
+            targets = np.zeros(0, dtype=np.float32)
+            tables = np.zeros(0, dtype=np.float32)
+            fens, done = [], 0
 
     fresh_rows, fresh_targets, fresh_tables, fresh_fens = load(source, limit, skip=done)
-    rows.extend(fresh_rows)
-    targets.extend(fresh_targets)
-    tables.extend(fresh_tables)
     fens.extend(fresh_fens)
+    if fresh_rows:
+        width = max(packed.shape[1], max(len(found) for found in fresh_rows))
+        block, block_lengths = as_block(fresh_rows, width)
+        packed = np.concatenate([widen_block(packed, width), block]) if len(lengths) else block
+        lengths = np.concatenate([lengths, block_lengths])
+        targets = np.concatenate([targets, np.asarray(fresh_targets, dtype=np.float32)])
+        tables = np.concatenate([tables, np.asarray(fresh_tables, dtype=np.float32)])
     if fresh_rows and limit:
         # A limited run is for debugging. Writing its partial result to the cache while
         # recording the whole file as consumed poisons every later run, which is exactly what
         # happened: a --limit 80000 smoke test left the next full run training on 80k rows.
-        print(f"  {len(rows):,} positions (limited run, cache left alone)")
-        return rows, targets, tables, fens
+        print(f"  {len(lengths):,} positions (limited run, cache left alone)")
+        return packed, lengths, targets, tables, fens
 
     if fresh_rows:
         print(f"  extracted features for {len(fresh_rows):,} new positions")
-        widest = max((len(found) for found in rows), default=1)
-        packed = np.zeros((len(rows), widest), dtype=np.int32)
-        lengths = np.zeros(len(rows), dtype=np.int32)
-        for index, found in enumerate(rows):
-            packed[index, : len(found)] = found
-            lengths[index] = len(found)
         np.savez(
             store,
             packed=packed,
             lengths=lengths,
-            targets=np.asarray(targets, dtype=np.float32),
-            tables=np.asarray(tables, dtype=np.float32),
+            targets=targets,
+            tables=tables,
             consumed=np.asarray([count_lines(source)], dtype=np.int64),
         )
         names.write_text(chr(10).join(fens) + chr(10), encoding="utf-8")
-    return rows, targets, tables, fens
+    return packed, lengths, targets, tables, fens
 
 
 def count_lines(path: Path) -> int:
@@ -228,6 +230,41 @@ def pack(rows: list[list[int]]) -> torch.Tensor:
     for row, found in enumerate(rows):
         packed[row, : len(found)] = torch.tensor(found[:MAX_PIECES], dtype=torch.long)
     return packed
+
+
+def widen_block(block: np.ndarray, width: int) -> np.ndarray:
+    """Grow a stored feature block to a wider one, leaving the new columns empty."""
+    if block.shape[1] >= width:
+        return block
+    grown = np.zeros((block.shape[0], width), dtype=np.int32)
+    grown[:, : block.shape[1]] = block
+    return grown
+
+
+def as_block(rows: list[list[int]], width: int) -> tuple[np.ndarray, np.ndarray]:
+    """Python lists from a fresh extraction, packed into an array and its row lengths."""
+    block = np.zeros((len(rows), width), dtype=np.int32)
+    lengths = np.zeros(len(rows), dtype=np.int32)
+    for index, found in enumerate(rows):
+        lengths[index] = len(found)
+        block[index, : len(found)] = found
+    return block, lengths
+
+
+def padded(block: np.ndarray, lengths: np.ndarray) -> torch.Tensor:
+    """The (positions, 32) table the network reads, built without touching a row at a time.
+
+    Zero is a real feature index -- own pawn on a1 -- so the filler in the stored block cannot
+    be read as padding. The row lengths say where each position's features stop, and everything
+    at or beyond that is PAD.
+    """
+    kept = min(block.shape[1], MAX_PIECES)
+    table = np.full((block.shape[0], MAX_PIECES), PAD, dtype=np.int64)
+    if kept:
+        columns = np.arange(kept, dtype=np.int32)
+        inside = columns[None, :] < lengths[:, None]
+        table[:, :kept] = np.where(inside, block[:, :kept], PAD)
+    return torch.from_numpy(table)
 
 
 class Network(torch.nn.Module):
@@ -314,28 +351,28 @@ def main() -> None:
     if device.type == "cuda":
         print(f"  training on {torch.cuda.get_device_name(0)}")
 
-    rows, targets, tables, fens = cached(arguments.data, arguments.limit)
-    print(f"{len(rows):,} positions, {arguments.hidden} hidden units")
-    if len(rows) < 5_000:
+    block, lengths, targets, tables, fens = cached(arguments.data, arguments.limit)
+    count = len(lengths)
+    print(f"{count:,} positions, {arguments.hidden} hidden units")
+    if count < 5_000:
         raise SystemExit("not enough positions to train anything trustworthy")
 
-    features = pack(rows).to(device)
-    count = len(rows)
+    features = padded(block, lengths).to(device)
 
     if arguments.residual:
         # Subtract what the tables already score, so the network is only asked for the part
         # they get wrong. It then starts level with them rather than having to catch up.
-        targets = [
-            target - scored for target, scored in zip(targets, tables, strict=True)
-        ]
-        spread = sum(abs(target) for target in targets) / max(len(targets), 1)
+        targets = targets - tables
+        spread = float(np.abs(targets).mean()) if count else 0.0
         print(f"  residual targets: {spread:.0f}cp away from the tables on average")
     groups: list[int] = []
     if arguments.outcomes and arguments.outcomes.is_file():
         mixed, groups = blend_targets(fens, targets, arguments.outcomes, arguments.outcome_weight)
         wanted = torch.tensor(mixed, dtype=torch.float32).to(device)
     else:
-        wanted = torch.sigmoid(torch.tensor(targets, dtype=torch.float32) * SCALE).to(device)
+        wanted = torch.sigmoid(
+            torch.from_numpy(np.asarray(targets, dtype=np.float32)) * SCALE
+        ).to(device)
 
     if groups:
         # Split by game: positions from one game share a result, so splitting by position puts
