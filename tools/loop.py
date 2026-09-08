@@ -191,6 +191,27 @@ def warm_start(hidden: int) -> Path | None:
     return WIDE
 
 
+def check_tablebases() -> None:
+    """Refuse to run an agent that is not the agent we ship.
+
+    The tablebases went missing from the champion and from every candidate and nothing
+    noticed for a very long time, because nothing was looking. Every promotion in that
+    period was decided by agents that played four man endings by search while the uploaded
+    one played them by lookup.
+    """
+    shipped = len(list((Path("weights") / "syzygy").glob("*.rtb*")))
+    if not shipped:
+        return
+    missing = copy_tablebases(CHAMPION)
+    if missing < shipped:
+        raise SystemExit(
+            f"the champion has {missing} tablebase files and the repository has "
+            f"{shipped}. Every match it plays would be decided by an agent that is not "
+            f"the one we upload."
+        )
+    note(f"champion carries {shipped} tablebase files, as the shipped agent does")
+
+
 def check_tables() -> None:
     """Refuse to run if the champion's tables are not the ones training will fit against.
 
@@ -219,7 +240,28 @@ def prepare_champion(hidden: int) -> None:
     CHAMPION.mkdir(parents=True, exist_ok=True)
     shutil.copy("agent.py", CHAMPION / "agent.py")
     shutil.copy("weights.py", CHAMPION / "weights.py")
+    copy_tablebases(CHAMPION)
     note(f"champion seeded from the shipped agent ({hidden} hidden units to be trained)")
+
+
+def copy_tablebases(destination: Path) -> int:
+    """Give an agent directory the tablebases the shipped agent has.
+
+    Every local agent has to be the agent that plays rated games. These were left out of
+    the champion and of every candidate, so self-play and every promotion match were
+    decided by agents that searched four man endings the real one looks up.
+    """
+    source = Path("weights") / "syzygy"
+    if not source.is_dir():
+        return 0
+    target = destination / "weights" / "syzygy"
+    target.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for table in source.glob("*.rtb*"):
+        if not (target / table.name).is_file():
+            shutil.copy(table, target / table.name)
+        copied += 1
+    return copied
 
 
 def build_candidate(source: Path, net: Path) -> None:
@@ -230,6 +272,7 @@ def build_candidate(source: Path, net: Path) -> None:
     shutil.copy(source / "agent.py", CANDIDATE / "agent.py")
     shutil.copy(source / "weights.py", CANDIDATE / "weights.py")
     shutil.copy(net, CANDIDATE / "weights" / "net.npz")
+    copy_tablebases(CANDIDATE)
 
 
 def selfplay_log():
@@ -433,6 +476,7 @@ def main() -> None:
     arguments.train_python = trainer
     prepare_champion(arguments.hidden)
     check_tables()
+    check_tablebases()
     # Games for the next round, generated while this one trains and plays its match.
     pending: subprocess.Popen | None = None
 
