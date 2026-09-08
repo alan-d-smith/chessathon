@@ -315,12 +315,30 @@ def main() -> None:
     parser.add_argument("--holdout", type=float, default=0.1)
     parser.add_argument("--limit", type=int)
     parser.add_argument(
-        "--window",
+        "--sample",
         type=int,
         help=(
-            "train on only the most recent positions. The pool keeps everything, but a "
-            "round whose own games are a fraction of a percent of what it fits cannot "
-            "learn anything from them"
+            "positions drawn from the whole pool each epoch. Defaults to all of them; "
+            "set it smaller when the pool is too large to sweep every epoch"
+        ),
+    )
+    parser.add_argument(
+        "--recent",
+        type=int,
+        default=0,
+        help=(
+            "how many trailing positions count as recent play. A round adds a fraction "
+            "of a percent to the pool, so without this its own games never reach the "
+            "gradient and every round refits the same network"
+        ),
+    )
+    parser.add_argument(
+        "--recent-draw",
+        type=int,
+        default=0,
+        help=(
+            "positions drawn from recent play each epoch, alongside --sample from the "
+            "whole pool. Half of --sample is two to one"
         ),
     )
     parser.add_argument("--warm", type=Path, help="start from an existing net instead of noise")
@@ -361,12 +379,6 @@ def main() -> None:
         print(f"  training on {torch.cuda.get_device_name(0)}")
 
     block, lengths, targets, tables, fens = cached(arguments.data, arguments.limit)
-    if arguments.window and len(lengths) > arguments.window:
-        # The cache keeps every position; this only narrows what is fitted this round.
-        recent = slice(len(lengths) - arguments.window, None)
-        block, lengths = block[recent], lengths[recent]
-        targets, tables, fens = targets[recent], tables[recent], fens[recent]
-        print(f"  training on the most recent {arguments.window:,} positions")
     count = len(lengths)
     print(f"{count:,} positions, {arguments.hidden} hidden units")
     if count < 5_000:
@@ -431,23 +443,49 @@ def main() -> None:
     kept = {name: tensor.detach().clone() for name, tensor in net.state_dict().items()}
     # Uniform to begin with; prioritised sampling replaces this once there are errors to rank by.
     priority = torch.ones(len(train), dtype=torch.float64, device=device)
+    # Training rows from the last few rounds of self-play. The pool is ordered by when a
+    # position was first seen, so recent play is its tail.
+    recent = train[train >= max(0, count - arguments.recent)] if arguments.recent else None
+    whole_draw = min(arguments.sample, len(train)) if arguments.sample else len(train)
+    from_recent = arguments.recent_draw if recent is not None and len(recent) else 0
+    if from_recent:
+        print(
+            f"  each epoch: {whole_draw:,} from the pool of {len(train):,}, "
+            f"{from_recent:,} from the {len(recent):,} most recent"
+        )
     for epoch in range(arguments.epochs):
         # Timed, because these runs are long enough that knowing an epoch's cost is the
         # difference between watching progress and watching a cursor.
         epoch_started = time.monotonic()
         net.train()
+        whole = whole_draw
         if arguments.priority > 0.0 and epoch > 0:
             chance = priority / priority.sum()
-            picked = torch.multinomial(chance, len(train), replacement=True)
-            shuffled = train[picked]
+            picked = torch.multinomial(chance, whole, replacement=True)
             # Sampling hard positions more often skews the gradient towards them, and the
             # hardest positions are often the ones the labeller got wrong. The importance
             # weight is what buys the focus without inheriting the bias that comes with it.
-            weight = (1.0 / (len(train) * chance[picked])) ** arguments.correction
-            batch_weight = (weight / weight.max()).float()
+            weights = (1.0 / (len(train) * chance[picked])) ** arguments.correction
+        elif whole == len(train):
+            picked = torch.randperm(len(train), device=device)
+            weights = torch.ones(whole, dtype=torch.float64, device=device)
         else:
-            shuffled = train[torch.randperm(len(train), device=device)]
-            batch_weight = torch.ones(len(train), dtype=torch.float32, device=device)
+            picked = torch.randint(len(train), (whole,), device=device)
+            weights = torch.ones(whole, dtype=torch.float64, device=device)
+        rows = train[picked]
+
+        if from_recent:
+            # Drawn flat rather than prioritised: the point of these is that they are new,
+            # not that they are hard, and the network has not seen them enough to rank them.
+            taken = torch.randint(len(recent), (from_recent,), device=device)
+            rows = torch.cat([rows, recent[taken]])
+            weights = torch.cat(
+                [weights, torch.ones(from_recent, dtype=torch.float64, device=device)]
+            )
+
+        order = torch.randperm(len(rows), device=device)
+        shuffled = rows[order]
+        batch_weight = (weights / weights.max()).float()[order]
 
         # Kept on the device. Reading it here would block until the batch finished, and
         # that stall, once per batch, is what left the gpu idle and one core saturated.

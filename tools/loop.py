@@ -319,13 +319,25 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--priority", type=float, default=0.6)
     parser.add_argument(
-        "--window",
+        "--sample",
         type=int,
-        default=2_000_000,
+        default=1_000_000,
+        help="positions drawn from the whole pool each epoch",
+    )
+    parser.add_argument(
+        "--recent-draw",
+        type=int,
+        default=500_000,
+        help="positions drawn from recent play each epoch: two of the pool to one of these",
+    )
+    parser.add_argument(
+        "--recent",
+        type=int,
+        default=200_000,
         help=(
-            "how many of the most recent positions a round trains on. The pool keeps "
-            "everything; without a window a round's own games are a fraction of a "
-            "percent of what it fits, and every round produces the same network"
+            "trailing positions treated as recent play, about three rounds of games. A "
+            "third of every epoch is drawn from these, so a round can learn from what it "
+            "just played instead of refitting the same network on the same pool"
         ),
     )
     parser.add_argument("--workers", type=int, default=48)
@@ -480,7 +492,9 @@ def main() -> None:
                 note(f"round {round_number}: labelling failed, skipping round")
                 continue
             total = sum(1 for _ in LABELS.open(encoding="utf-8"))
-            fitted = min(total, arguments.window) if arguments.window else total
+            fitted = (min(total, arguments.sample) if arguments.sample else total) + (
+                arguments.recent_draw
+            )
             epochs = max(MIN_EPOCHS, min(arguments.epochs, TARGET_SAMPLES // max(fitted, 1)))
             note(
                 f"round {round_number}: {total:,} labelled positions in the pool, "
@@ -501,7 +515,9 @@ def main() -> None:
                     "--epochs", str(epochs),
                     "--rate", arguments.rate,
                     "--priority", str(arguments.priority),
-                    "--window", str(arguments.window),
+                    "--sample", str(arguments.sample),
+                    "--recent", str(arguments.recent),
+                    "--recent-draw", str(arguments.recent_draw),
                     # Both signals: the engine score for precision, the game result for truth.
                     "--outcomes", str(OUTCOMES),
                     "--outcome-weight", str(arguments.outcome_weight),
