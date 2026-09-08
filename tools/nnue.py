@@ -333,6 +333,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--rerank",
+        type=int,
+        default=5,
+        help=(
+            "how many epochs between re-scoring the pool for prioritised sampling. "
+            "Scoring it is a pass over every position, which costs more than an epoch "
+            "that only draws a sample of them"
+        ),
+    )
+    parser.add_argument(
         "--recent-draw",
         type=int,
         default=0,
@@ -503,7 +513,12 @@ def main() -> None:
             # the training number stays comparable with the holdout beside it.
             total += errors.detach().sum()
 
-        if arguments.priority > 0.0:
+        # Scored after the first epoch so the next one has something real to go on, and
+        # then only every few: an error ranking does not move much in one epoch, and the
+        # pass that produces it costs more than the epoch beside it.
+        if arguments.priority > 0.0 and (
+            epoch == 0 or (epoch + 1) % arguments.rerank == 0
+        ):
             # Re-rank on what the net now gets wrong, so the next pass chases current errors
             # rather than the ones it has already learned away.
             with torch.no_grad():
