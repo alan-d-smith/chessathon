@@ -60,6 +60,13 @@ INCREMENT_SHARE: Final = 0.75
 # starved tail. So the trigger is the score falling, not the move moving.
 EXTENSION_FACTOR: Final = 2.5
 INSTABILITY_CP: Final = 40
+# A score that falls is not the only way a search says it is unsure. Round 72 threw a won
+# game on a move whose score never moved 25 points while the root move changed on every one
+# of five iterations, and one more iteration played the move that held the win. A search
+# that has never once agreed with itself has not found its move yet. Counted over 272 rated
+# moves this fires on 8.1%, where extending on any root change fires on 26.5% and spends a
+# clock that has nothing spare. The floor is because agreeing at depth two means nothing.
+CHURN_MIN_ITERATIONS: Final = 4
 ASSUMED_INCREMENT_MS: Final = 500
 # Twice the published increment. The inferred value feeds a budget whose spend feeds the next
 # inference, so it needs a ceiling that a feedback loop cannot climb past.
@@ -1970,6 +1977,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
     choice = legal[0]
     settled: chess.Move | None = None
     previous_score = -INFINITY
+    changes = 0  # iterations whose best move differed from the one before it
     # Nothing stood in twice means no threefold is reachable, and the scan below can be skipped
     # entirely, which is every move of a normal game.
     repeatable = any(count >= 2 for count in seen.values())
@@ -2056,6 +2064,11 @@ def get_move(fen: str, time_left_ms: int) -> str:
         # settled search finds it already behind and the next iteration stops on its first
         # clock check, costing microseconds.
         unstable = settled is not None and best_score < previous_score - INSTABILITY_CP
+        if settled is not None and best_move != settled:
+            changes += 1
+        # Never the same move twice running, from a depth where that means something.
+        if depth >= CHURN_MIN_ITERATIONS and changes == depth - 1:
+            unstable = True
         settled, previous_score = best_move, best_score
         if unstable:
             extensions += 1
