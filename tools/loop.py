@@ -55,6 +55,10 @@ NET = Path("data/nets/loop_net.npz")
 # best one measured makes it a climb.
 BEST = Path("data/nets/loop_best.npz")
 BEST_SCORE = Path("data/nets/loop_best.txt")
+# The net training continues from, which is the previous round's unless that round was
+# measurably worse. A per round gain smaller than the noise can never prove itself in one
+# match; it can only accumulate, and it cannot accumulate if every round starts over.
+CHAIN = Path("data/nets/loop_chain.npz")
 # Where a widened copy of the best net goes when the width being trained has changed.
 WIDE = Path("data/nets/loop_best_wide.npz")
 LOG = Path("data/loop_log.txt")
@@ -168,6 +172,20 @@ def read_best() -> float:
         return float("-inf")
 
 
+def spread_of(verdict: list[str]) -> float | None:
+    """The half width of the interval on the measured Elo, or None when there was none."""
+    for line in verdict:
+        if not line.startswith("elo "):
+            continue
+        parts = line.split()
+        try:
+            interval = float(parts[3])
+        except (IndexError, ValueError):
+            return None
+        return interval if interval > 0.0 else None
+    return None
+
+
 def warm_start(hidden: int) -> Path | None:
     """The network to build on, widened if the width being trained has changed.
 
@@ -177,16 +195,17 @@ def warm_start(hidden: int) -> Path | None:
     duplicated and contributes proportionally less -- so the wider net starts at the narrower
     one's quality and training pulls the copies apart from there.
     """
-    if not BEST.is_file():
+    source = CHAIN if CHAIN.is_file() else BEST
+    if not source.is_file():
         return None
-    with numpy.load(BEST) as data:
+    with numpy.load(source) as data:
         stored = int(data["hidden_bias"].shape[0])
     if stored == hidden:
-        return BEST
+        return source
     if hidden % stored:
         note(f"warm start skipped: {stored} units do not divide into {hidden}")
         return None
-    widen(BEST, WIDE, hidden, noise=0.02, seed=0)
+    widen(source, WIDE, hidden, noise=0.02, seed=0)
     note(f"warm start widened from {stored} to {hidden} units")
     return WIDE
 
@@ -599,9 +618,12 @@ def main() -> None:
             for line in verdict:
                 note(f"round {round_number}: {line.strip()}")
 
-            # Keep the best candidate measured, not the most recent one trained, and start the next
-            # round from it. Round 2 fitted the labels better than round 1 and played 38 Elo worse,
-            # which is exactly the case where following the training loss walks downhill.
+            # Two different questions. Which network is the best one measured, which is worth
+            # recording and nothing else, and which network the next round trains from, which
+            # is this one unless it went backwards. Round 2 fitted the labels better than round
+            # 1 and played 38 Elo worse, so training loss alone cannot choose; a match can, but
+            # only to the precision it has, and a high water mark on a noisy measurement ends up
+            # recording the luckiest round rather than the best one.
             measured = elo_of(verdict)
             if measured is not None:
                 previous = read_best()
@@ -609,8 +631,24 @@ def main() -> None:
                     shutil.copy(NET, BEST)
                     BEST_SCORE.write_text(f"{measured:.1f}" + chr(10), encoding="utf-8")
                     note(f"round {round_number}: best candidate so far at {measured:+.0f} elo")
+
+                # A round that did not prove itself has still seen more play than the one
+                # before it, and the next round is where that shows. Only a candidate whose
+                # whole interval is below zero is worth abandoning, and abandoning it means
+                # returning to the champion, which is the last network that proved anything.
+                spread = spread_of(verdict)
+                sliding = spread is not None and measured + spread < 0.0
+                if sliding:
+                    champion_net = CHAMPION / "weights" / "net.npz"
+                    if champion_net.is_file():
+                        shutil.copy(champion_net, CHAIN)
+                        note(
+                            f"round {round_number}: {measured:+.0f} +/- {spread:.0f} is behind, "
+                            f"training restarts from the champion"
+                        )
                 else:
-                    note(f"round {round_number}: keeping the {previous:+.0f} elo net to build on")
+                    shutil.copy(NET, CHAIN)
+                    note(f"round {round_number}: next round builds on this one")
 
             promote = any("accepted" in line for line in verdict)
             if promote:
@@ -653,6 +691,7 @@ def main() -> None:
                 # kept building on a network the champion had already overtaken. A champion is
                 # zero against itself, and the network to build on is now its own.
                 shutil.copy(NET, BEST)
+                shutil.copy(NET, CHAIN)
                 BEST_SCORE.write_text("0.0" + chr(10), encoding="utf-8")
                 note(f"round {round_number}: PROMOTED, the champion now uses the network")
             else:
