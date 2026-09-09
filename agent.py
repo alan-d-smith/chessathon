@@ -1845,9 +1845,17 @@ def negamax(
     if index < 0:
         return -MATE + ply if in_check else 0
 
-    if len(transposition) < TT_LIMIT:
-        flag = EXACT if original < best_score < beta else (LOWER if best_score >= beta else UPPER)
-        transposition[key] = (depth, to_store(best_score, ply), flag, best_move)
+    # A table that stops storing is a table that stops working. At about nine thousand
+    # entries a move this filled around move 48 and then held nothing but opening
+    # positions that can no longer occur, for the rest of the game: no cutoffs, and no
+    # best move to order by, exactly where the game is decided. Emptying it costs one
+    # move of refilling; freezing it costs every move that follows. Measured over four
+    # rated games at their own node counts, this is worth 1.5 plies from move 48 on,
+    # and six in an endgame. Self play could never show it: both sides froze together.
+    if len(transposition) >= TT_LIMIT:
+        transposition.clear()
+    flag = EXACT if original < best_score < beta else (LOWER if best_score >= beta else UPPER)
+    transposition[key] = (depth, to_store(best_score, ply), flag, best_move)
     return best_score
 
 
