@@ -26,7 +26,7 @@ import weights
 
 # Bumped when a build is frozen for upload. The digest below is what actually identifies a
 # build; this is only here so a log is readable without looking anything up.
-VERSION: Final = "v10"
+VERSION: Final = "v11"
 
 INFINITY: Final = 1 << 20
 MATE: Final = 1 << 16
