@@ -26,7 +26,7 @@ import weights
 
 # Bumped when a build is frozen for upload. The digest below is what actually identifies a
 # build; this is only here so a log is readable without looking anything up.
-VERSION: Final = "v11"
+VERSION: Final = "v12"
 
 INFINITY: Final = 1 << 20
 MATE: Final = 1 << 16
@@ -94,7 +94,10 @@ PIECE_ORDER: Final = (
     chess.KING,
 )
 
-TT_LIMIT: Final = 400_000
+# One entry per slot, indexed by the key's hash. A power of two so the index is a mask.
+TT_BITS: Final = 20
+TT_SIZE: Final = 1 << TT_BITS
+TT_MASK: Final = TT_SIZE - 1
 # Walking back to a position seen once is worth discouraging, not forbidding: sometimes
 # it is the only move. Walking into the third occurrence is not a matter of degree, and
 # is scored below as the draw it actually is.
@@ -251,7 +254,13 @@ class Timeout(Exception):
 
 # Module state survives between the moves of one game and never into the next, which is exactly
 # the lifetime a transposition table wants.
-transposition: dict[Hashable, tuple[int, int, int, chess.Move | None]] = {}
+# slot -> (signature, depth, score, flag, move, generation), or None while never written.
+transposition: list[tuple[int, int, int, int, chess.Move | None, int] | None] = (
+    [None] * TT_SIZE
+)
+# Which search an entry belongs to. Entries from an earlier move are the first to go when
+# a slot is contested, because the position they describe is usually behind us.
+generation = 0
 # Killers and history are keyed by move_key rather than by Move: the objects are dataclasses
 # and comparing them is one of the more expensive things the ordering used to do.
 killers: list[list[int]] = [[-1, -1] for _ in range(MAX_DEPTH + 2)]
@@ -1747,10 +1756,18 @@ def negamax(
     # Private, but it is the key the board already keeps for its own repetition checks, and it
     # is the one docs/IDEAS.md points at.
     key = board._transposition_key()
-    stored = transposition.get(key)
-    if stored is not None and stored[0] >= depth:
-        score = from_store(stored[1], ply)
-        flag = stored[2]
+    signature = hash(key)
+    # Not "slot": the killer update below already uses that name, and the store at the
+    # end of this function needs this index intact.
+    bucket = signature & TT_MASK
+    stored = transposition[bucket]
+    # A slot holds whatever position last claimed it, so the signature has to be checked
+    # before the entry means anything at all.
+    if stored is not None and stored[0] != signature:
+        stored = None
+    if stored is not None and stored[1] >= depth:
+        score = from_store(stored[2], ply)
+        flag = stored[3]
         if flag == EXACT:
             return score
         if flag == LOWER:
@@ -1790,7 +1807,7 @@ def negamax(
     best_move: chess.Move | None = None
     best_score = -INFINITY
     index = -1
-    for index, move in enumerate(candidates(board, stored[3] if stored else None, ply)):
+    for index, move in enumerate(candidates(board, stored[4] if stored else None, ply)):
         quiet = not board.is_capture(move) and move.promotion is None
         push_move(board, move)
         # Asked once here and then handed down: futility wants it, so does late move
@@ -1852,17 +1869,22 @@ def negamax(
     if index < 0:
         return -MATE + ply if in_check else 0
 
-    # A table that stops storing is a table that stops working. At about nine thousand
-    # entries a move this filled around move 48 and then held nothing but opening
-    # positions that can no longer occur, for the rest of the game: no cutoffs, and no
-    # best move to order by, exactly where the game is decided. Emptying it costs one
-    # move of refilling; freezing it costs every move that follows. Measured over four
-    # rated games at their own node counts, this is worth 1.5 plies from move 48 on,
-    # and six in an endgame. Self play could never show it: both sides froze together.
-    if len(transposition) >= TT_LIMIT:
-        transposition.clear()
+    # Take the slot unless it holds something worth more: a deeper result from this same
+    # search. Anything from an earlier move goes without argument, because the position it
+    # describes is usually one we have already played through. The old table never replaced
+    # at all -- it filled by about move 48 and then refused every store for the rest of the
+    # game, which cost 1.5 ply from that point and six in an endgame.
     flag = EXACT if original < best_score < beta else (LOWER if best_score >= beta else UPPER)
-    transposition[key] = (depth, to_store(best_score, ply), flag, best_move)
+    existing = transposition[bucket]
+    if (
+        existing is None
+        or existing[5] != generation
+        or existing[0] == signature
+        or depth >= existing[1]
+    ):
+        transposition[bucket] = (
+            signature, depth, to_store(best_score, ply), flag, best_move, generation
+        )
     return best_score
 
 
@@ -1875,6 +1897,11 @@ def remaining_moves(move_number: int) -> int:
     out. At this floor it settles around two seconds remaining, spending the increment.
     """
     return max(MIN_REMAINING_MOVES, EXPECTED_TOTAL_MOVES - move_number)
+
+
+def reset_transposition() -> None:
+    """Empty the table, which is only ever right between games rather than during one."""
+    transposition[:] = [None] * TT_SIZE
 
 
 def budget_s(time_left_ms: int, move_number: int) -> tuple[float, float]:
@@ -1945,6 +1972,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
     time_left_ms  your clock before this move, in milliseconds
     """
     global deadline, nodes, reached, increment_ms, last_clock_ms, last_spent_ms, extensions
+    global generation
     global accumulating
 
     board = chess.Board(fen)
@@ -1967,6 +1995,8 @@ def get_move(fen: str, time_left_ms: int) -> str:
     # move can never equal one with them to move. Without the move played below, this check
     # was dead code that had never once fired.
     seen[board._transposition_key()] += 1
+    # A new search, so everything already in the table belongs to an older one.
+    generation = (generation + 1) & 0xFFFF
     soft, hard = budget_s(time_left_ms, board.fullmove_number)
     deadline = started + soft
     nodes = 0

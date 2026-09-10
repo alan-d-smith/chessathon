@@ -36,7 +36,7 @@ OVERRUN_ALLOWANCE_MS = 250.0
 
 
 def reset(agent: ModuleType) -> None:
-    agent.transposition.clear()
+    agent.reset_transposition()
     agent.pawn_cache.clear()
     agent.seen.clear()
     # History is a flat table rather than a dict, and may be a numpy array when the compiled

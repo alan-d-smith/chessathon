@@ -41,7 +41,7 @@ def run(agent: ModuleType, budget_ms: int) -> None:
         # The agent budgets a share of the clock over the moves it expects to still play,
         # so the clock that yields a given budget depends on how far in the position is.
         clock = budget_ms * agent.remaining_moves(chess.Board(fen).fullmove_number)
-        agent.transposition.clear()
+        agent.reset_transposition()
         agent.seen.clear()
         # The agent infers the increment from how the clock moves between its turns. A bench
         # hands it the same clock every time, which reads as a huge increment unless reset.
